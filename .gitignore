@@ -1,13 +1,30 @@
+# Entorno
 .env
+*.env
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
 .Python
+*.so
+
+# Virtualenv
 venv/
 .venv/
-logs/*.log
-*.egg-info/
-dist/
-build/
+env/
+
+# Logs y resultados
+logs/
+*.log
+backtest_results.csv
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
 .DS_Store
+Thumbs.db

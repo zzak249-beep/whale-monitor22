@@ -19,16 +19,16 @@ from datetime import datetime, timezone
 os.makedirs("logs", exist_ok=True)
 
 import config
-from exchange.bingx_client           import BingXClient
-from strategy.htf_bias               import calculate_htf_bias
-from strategy.ema10_cross            import calculate_ema10_signal
-from strategy.structure              import detect_bos
-from strategy.volume_cvd             import calculate_volume_cvd
-from strategy.signals                import aggregate_signals
-from risk.manager                    import RiskManager
-from risk.monitor                    import PositionMonitor
-from notifications.telegram_notifier import TelegramNotifier
-from utils.logger                    import get_logger
+from exchange.bingx_client            import BingXClient
+from strategy.htf_bias                import calculate_htf_bias
+from strategy.ema10_cross             import calculate_ema10_signal
+from strategy.structure               import detect_bos
+from strategy.volume_cvd              import calculate_volume_cvd
+from strategy.signals                 import aggregate_signals
+from risk.manager                     import RiskManager
+from risk.monitor                     import PositionMonitor
+from notifications.telegram_notifier  import TelegramNotifier
+from utils.logger                     import get_logger
 
 log    = get_logger("Main")
 client = BingXClient()
@@ -43,9 +43,15 @@ MIN_BARS_COOLDOWN = 3
 
 def _normalize(c) -> dict:
     if isinstance(c, list):
-        return {"time": c[0], "open": float(c[1]), "high": float(c[2]),
-                "low": float(c[3]), "close": float(c[4]), "volume": float(c[5])}
-    return {k: float(v) if k != "time" else v for k, v in c.items()}
+        return {
+            "time":   int(c[0]),
+            "open":   float(c[1]),
+            "high":   float(c[2]),
+            "low":    float(c[3]),
+            "close":  float(c[4]),
+            "volume": float(c[5]),
+        }
+    return {k: (float(v) if k != "time" else int(v)) for k, v in c.items()}
 
 
 async def load_candles(symbol: str, interval: str, limit: int = 300) -> list[dict]:
@@ -100,29 +106,41 @@ async def analyze_and_trade(symbol: str):
         return
 
     sizing = risk.calculate_position_size(
-        equity=equity, entry_price=signal.entry_price,
-        stop_loss=signal.stop_loss, size_mult=signal.size_mult)
+        equity=equity,
+        entry_price=signal.entry_price,
+        stop_loss=signal.stop_loss,
+        size_mult=signal.size_mult,
+    )
     if not sizing.valid:
         return
 
     side     = "BUY"  if signal.direction == "LONG"  else "SELL"
     pos_side = "LONG" if signal.direction == "LONG"  else "SHORT"
 
-    log.info(f"EJECUTANDO {symbol} {signal.direction} [{signal.entry_type}] "
-             f"qty={sizing.qty} SL={signal.stop_loss:.4f} TP={signal.take_profit:.4f}")
+    log.info(
+        f"EJECUTANDO {symbol} {signal.direction} [{signal.entry_type}] "
+        f"qty={sizing.qty} SL={signal.stop_loss:.4f} TP={signal.take_profit:.4f}"
+    )
 
     result = await client.place_order(
         symbol=symbol, side=side, position_side=pos_side,
-        qty=sizing.qty, sl_price=signal.stop_loss, tp_price=signal.take_profit)
+        qty=sizing.qty, sl_price=signal.stop_loss, tp_price=signal.take_profit,
+    )
 
     if result:
-        await risk.register_open(symbol, signal.direction, signal.entry_price,
-                                 sizing.qty, signal.stop_loss, signal.take_profit)
-        pmon.track(symbol, signal.direction, signal.entry_price,
-                   sizing.qty, signal.stop_loss, signal.take_profit)
-        tg.order_placed(symbol, signal.direction, sizing.qty,
-                        signal.entry_price, signal.stop_loss,
-                        signal.take_profit, config.DRY_RUN)
+        await risk.register_open(
+            symbol, signal.direction, signal.entry_price,
+            sizing.qty, signal.stop_loss, signal.take_profit,
+        )
+        pmon.track(
+            symbol, signal.direction, signal.entry_price,
+            sizing.qty, signal.stop_loss, signal.take_profit,
+        )
+        tg.order_placed(
+            symbol, signal.direction, sizing.qty,
+            signal.entry_price, signal.stop_loss,
+            signal.take_profit, config.DRY_RUN,
+        )
 
 
 def make_ws_callback(symbol: str, interval: str):
@@ -132,11 +150,11 @@ def make_ws_callback(symbol: str, interval: str):
         if not kline or not is_closed:
             return
         candle = {
-            "time": kline.get("t", 0),
-            "open":  float(kline.get("o", 0)),
-            "high":  float(kline.get("h", 0)),
-            "low":   float(kline.get("l", 0)),
-            "close": float(kline.get("c", 0)),
+            "time":   kline.get("t", 0),
+            "open":   float(kline.get("o", 0)),
+            "high":   float(kline.get("h", 0)),
+            "low":    float(kline.get("l", 0)),
+            "close":  float(kline.get("c", 0)),
             "volume": float(kline.get("v", 0)),
         }
         buf = candle_buffer.setdefault(symbol, {}).setdefault(interval, [])
@@ -203,10 +221,12 @@ async def main():
         for tf in [config.TF_HTF, config.TF_ENTRY]:
             key = f"{sym}_{tf}"
             client.register_ws_callback(key, make_ws_callback(sym, tf))
-            tasks.append(asyncio.create_task(client.stream_klines(sym, tf), name=f"ws_{sym}_{tf}"))
+            tasks.append(
+                asyncio.create_task(client.stream_klines(sym, tf), name=f"ws_{sym}_{tf}")
+            )
         tasks.append(asyncio.create_task(polling_loop(sym), name=f"poll_{sym}"))
-    tasks.append(asyncio.create_task(pmon.run(),            name="position_monitor"))
-    tasks.append(asyncio.create_task(daily_report_loop(),   name="daily_report"))
+    tasks.append(asyncio.create_task(pmon.run(),           name="position_monitor"))
+    tasks.append(asyncio.create_task(daily_report_loop(),  name="daily_report"))
     log.info(f"Bot corriendo — {len(tasks)} tareas activas")
     try:
         await asyncio.gather(*tasks)
