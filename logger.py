@@ -1,48 +1,54 @@
-"""
-Logger configurado con colores y formato estructurado
-"""
+"""Logger con colores para consola."""
 import logging
+import os
 import sys
-from datetime import datetime
-import config
+
+COLORS = {
+    "DEBUG":    "\033[36m",
+    "INFO":     "\033[32m",
+    "WARNING":  "\033[33m",
+    "ERROR":    "\033[31m",
+    "CRITICAL": "\033[35m",
+    "RESET":    "\033[0m",
+}
+
 
 class ColorFormatter(logging.Formatter):
-    COLORS = {
-        "DEBUG":    "\033[36m",   # Cyan
-        "INFO":     "\033[32m",   # Verde
-        "WARNING":  "\033[33m",   # Amarillo
-        "ERROR":    "\033[31m",   # Rojo
-        "CRITICAL": "\033[35m",   # Magenta
-    }
-    RESET = "\033[0m"
-
     def format(self, record):
-        color = self.COLORS.get(record.levelname, self.RESET)
-        ts    = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        msg   = super().format(record)
-        return f"{color}[{ts}] [{record.levelname}] {record.name} │ {record.getMessage()}{self.RESET}"
+        color = COLORS.get(record.levelname, COLORS["RESET"])
+        reset = COLORS["RESET"]
+        record.levelname = f"{color}{record.levelname:<8}{reset}"
+        record.name      = f"\033[1m{record.name}\033[0m"
+        return super().format(record)
+
 
 def get_logger(name: str) -> logging.Logger:
+    import config as cfg
+    level = getattr(logging, cfg.LOG_LEVEL.upper(), logging.INFO)
+
     logger = logging.getLogger(name)
     if logger.handlers:
         return logger
 
-    level = getattr(logging, config.LOG_LEVEL.upper(), logging.INFO)
     logger.setLevel(level)
 
     # Console handler
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(level)
-    ch.setFormatter(ColorFormatter())
+    ch.setFormatter(ColorFormatter(
+        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%H:%M:%S",
+    ))
     logger.addHandler(ch)
 
     # File handler
+    os.makedirs("logs", exist_ok=True)
     fh = logging.FileHandler("logs/bot.log", encoding="utf-8")
-    fh.setLevel(level)
+    fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(
-        "[%(asctime)s] [%(levelname)s] %(name)s | %(message)s"
+        fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     ))
     logger.addHandler(fh)
-
     logger.propagate = False
     return logger
