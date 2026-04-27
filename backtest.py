@@ -61,11 +61,9 @@ class Backtester:
     async def load_candles(self, interval: str, days: int) -> list[dict]:
         """Descarga velas históricas de BingX."""
         client  = BingXClient()
-        if "h" in interval:
-            candles_per_day = 24 // int(interval.replace("h", ""))
-        else:
-            candles_per_day = 24 * 60 // int(interval.replace("m", ""))
-        limit = min(days * candles_per_day, 1440)
+        limit   = min(days * (24 * 60 // int(interval.replace("m","").replace("h","") * 60
+                                              if "h" in interval else
+                                              int(interval.replace("m","")))), 1440)
         log.info(f"Descargando {limit} velas {interval} para {self.symbol}…")
         raw = await client.get_klines(self.symbol, interval, limit=limit)
         await client.close()
