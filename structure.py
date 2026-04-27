@@ -1,124 +1,72 @@
 """
-BREAK OF STRUCTURE (BOS) — Ruptura de estructura de mercado
-─────────────────────────────────────────────────────────────
-Lógica:
-  1. Detectar swing highs/lows en los últimos N periodos
-  2. BOS alcista: el precio cierra sobre el último swing high relevante
-  3. BOS bajista: el precio cierra bajo el último swing low relevante
-  4. Calcular zona de entrada óptima (POI — Point of Interest)
+STRUCTURE — Detección de Break of Structure (BOS)
+══════════════════════════════════════════════════
+Un BOS ocurre cuando el precio rompe el último swing high/low
+con una vela de cierre, confirmando momentum estructural.
 """
-import numpy as np
-from dataclasses import dataclass, field
-from typing import Literal, Optional
+from dataclasses import dataclass
 
 import config
 from utils.logger import get_logger
 
-log = get_logger("BOS")
-
-BosType = Literal["BULLISH", "BEARISH", "NONE"]
+log = get_logger("Structure")
 
 
 @dataclass
-class SwingPoint:
-    index:  int
-    price:  float
-    kind:   Literal["HIGH", "LOW"]
+class BOSResult:
+    bullish_bos:  bool    # Precio rompió swing high anterior
+    bearish_bos:  bool    # Precio rompió swing low anterior
+    swing_high:   float   # Último swing high relevante
+    swing_low:    float   # Último swing low relevante
+    bos_strength: float   # % de ruptura sobre el nivel
 
 
-@dataclass
-class BOSState:
-    bos_type:       BosType
-    broken_level:   float   # Nivel de estructura roto
-    last_swing_high: float
-    last_swing_low:  float
-    poi_zone_top:   float   # Zona de retorno óptimo (para entrada)
-    poi_zone_bot:   float
-    valid:          bool
+def _find_swing_high(candles: list[dict], lookback: int) -> float:
+    highs = [c["high"] for c in candles[-lookback:]]
+    return max(highs) if highs else 0.0
 
 
-def _find_swings(highs: np.ndarray, lows: np.ndarray, lookback: int) -> list[SwingPoint]:
-    """Swing pivot: punto más alto/bajo vs sus N vecinos a cada lado."""
-    swings = []
-    n = 3  # Velas a cada lado para confirmar el swing
-
-    for i in range(n, len(highs) - n):
-        # Swing High
-        if all(highs[i] > highs[i-j] for j in range(1, n+1)) and \
-           all(highs[i] > highs[i+j] for j in range(1, n+1)):
-            swings.append(SwingPoint(i, highs[i], "HIGH"))
-        # Swing Low
-        if all(lows[i] < lows[i-j] for j in range(1, n+1)) and \
-           all(lows[i] < lows[i+j] for j in range(1, n+1)):
-            swings.append(SwingPoint(i, lows[i], "LOW"))
-
-    # Solo últimos lookback relevantes
-    return swings[-lookback:] if len(swings) > lookback else swings
+def _find_swing_low(candles: list[dict], lookback: int) -> float:
+    lows = [c["low"] for c in candles[-lookback:]]
+    return min(lows) if lows else 0.0
 
 
-def detect_bos(candles: list[dict]) -> BOSState:
+def detect_bos(candles: list[dict]) -> BOSResult:
     """
-    Detecta ruptura de estructura en las velas de 15m.
+    Detecta BOS usando las últimas BOS_LOOKBACK velas (excluyendo la última).
+    La última vela es la que intenta romper el nivel.
     """
-    _none = BOSState("NONE", 0, 0, 0, 0, 0, False)
+    lb = config.BOS_LOOKBACK
 
-    if len(candles) < config.BOS_LOOKBACK + 10:
-        return _none
+    if len(candles) < lb + 5:
+        return BOSResult(False, False, 0.0, 0.0, 0.0)
 
-    highs  = np.array([float(c["high"])  for c in candles], dtype=np.float64)
-    lows   = np.array([float(c["low"])   for c in candles], dtype=np.float64)
-    closes = np.array([float(c["close"]) for c in candles], dtype=np.float64)
+    # Buscar swing H/L en las velas previas (sin incluir la última)
+    history    = candles[-(lb + 1):-1]
+    last_candle = candles[-1]
 
-    swings = _find_swings(highs, lows, config.BOS_LOOKBACK)
+    swing_high = _find_swing_high(history, lb)
+    swing_low  = _find_swing_low(history,  lb)
 
-    if not swings:
-        return _none
+    close = last_candle["close"]
 
-    swing_highs = [s for s in swings if s.kind == "HIGH"]
-    swing_lows  = [s for s in swings if s.kind == "LOW"]
+    bullish_bos = False
+    bearish_bos = False
+    bos_strength = 0.0
 
-    if not swing_highs or not swing_lows:
-        return _none
+    # BOS alcista: cierre supera el swing high con cuerpo positivo
+    if close > swing_high and last_candle["close"] > last_candle["open"]:
+        bullish_bos  = True
+        bos_strength = (close - swing_high) / swing_high * 100
 
-    last_sh = max(swing_highs, key=lambda s: s.index)
-    last_sl = min(swing_lows,  key=lambda s: s.index)
+    # BOS bajista: cierre rompe el swing low con cuerpo negativo
+    elif close < swing_low and last_candle["close"] < last_candle["open"]:
+        bearish_bos  = True
+        bos_strength = (swing_low - close) / swing_low * 100
 
-    price_now = closes[-1]
+    if bullish_bos:
+        log.debug(f"BOS BULLISH | close={close:.4f} > swing_high={swing_high:.4f} (+{bos_strength:.3f}%)")
+    if bearish_bos:
+        log.debug(f"BOS BEARISH | close={close:.4f} < swing_low={swing_low:.4f} (+{bos_strength:.3f}%)")
 
-    # ── Ruptura alcista: precio cierra sobre último swing high
-    if price_now > last_sh.price:
-        # POI: zona entre el 50% y 100% del swing roto (para entry en retroceso)
-        poi_top = last_sh.price
-        poi_bot = last_sh.price - (last_sh.price - last_sl.price) * 0.382  # Retroceso 38.2%
-
-        state = BOSState(
-            bos_type        = "BULLISH",
-            broken_level    = last_sh.price,
-            last_swing_high = last_sh.price,
-            last_swing_low  = last_sl.price,
-            poi_zone_top    = poi_top,
-            poi_zone_bot    = poi_bot,
-            valid           = True,
-        )
-        log.info(f"BOS BULLISH | roto={last_sh.price:.4f} | POI [{poi_bot:.4f}–{poi_top:.4f}]")
-        return state
-
-    # ── Ruptura bajista: precio cierra bajo último swing low
-    if price_now < last_sl.price:
-        poi_bot = last_sl.price
-        poi_top = last_sl.price + (last_sh.price - last_sl.price) * 0.382
-
-        state = BOSState(
-            bos_type        = "BEARISH",
-            broken_level    = last_sl.price,
-            last_swing_high = last_sh.price,
-            last_swing_low  = last_sl.price,
-            poi_zone_top    = poi_top,
-            poi_zone_bot    = poi_bot,
-            valid           = True,
-        )
-        log.info(f"BOS BEARISH | roto={last_sl.price:.4f} | POI [{poi_bot:.4f}–{poi_top:.4f}]")
-        return state
-
-    log.debug(f"BOS: sin ruptura | precio={price_now:.4f} SH={last_sh.price:.4f} SL={last_sl.price:.4f}")
-    return _none
+    return BOSResult(bullish_bos, bearish_bos, swing_high, swing_low, round(bos_strength, 4))
