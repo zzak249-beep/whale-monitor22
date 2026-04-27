@@ -150,27 +150,66 @@ class BingXClient:
         self._ws_callbacks[key] = callback
 
     async def stream_klines(self, symbol: str, interval: str):
-        key    = f"{symbol}_{interval}"
-        topic  = f"market.{symbol}.kline.{interval}"
-        ws_url = "wss://open-api.bingx.com/market"
-        backoff = 5
+        """
+        Stream WebSocket BingX — perpetual swap market data.
+        Si el WS no está disponible, simplemente espera: el polling_loop
+        en main.py cubre los datos como fallback principal.
+        """
+        import gzip as _gzip
+        key     = f"{symbol}_{interval}"
+        topic   = f"market.{symbol}.kline.{interval}"
+        # BingX swap perpetual WebSocket endpoint
+        ws_url  = "wss://open-api.bingx.com/market"
+        backoff = 10
+        ws_fails = 0
+
         while True:
+            # Si ya falló muchas veces seguidas, solo dormir y dejar al polling
+            if ws_fails >= 5:
+                log.info(f"WS {key}: demasiados fallos, usando solo polling. Reintento en 5min…")
+                await asyncio.sleep(300)
+                ws_fails = 0
+                continue
             try:
-                async with websockets.connect(ws_url, ping_interval=20, ping_timeout=30) as ws:
-                    await ws.send(json.dumps({"id": key, "reqType": "sub", "dataType": topic}))
+                extra_headers = {
+                    "User-Agent": "Mozilla/5.0",
+                }
+                async with websockets.connect(
+                    ws_url,
+                    extra_headers=extra_headers,
+                    ping_interval=None,   # BingX maneja su propio ping
+                    open_timeout=15,
+                    close_timeout=5,
+                ) as ws:
+                    sub_msg = json.dumps({
+                        "id":       key,
+                        "reqType":  "sub",
+                        "dataType": topic,
+                    })
+                    await ws.send(sub_msg)
                     log.info(f"WS suscrito: {topic}")
-                    backoff = 5
+                    backoff  = 10
+                    ws_fails = 0
+
                     async for raw in ws:
                         try:
+                            # BingX envía datos comprimidos con gzip
                             if isinstance(raw, bytes):
-                                import gzip
-                                try:    raw = gzip.decompress(raw).decode()
-                                except: raw = raw.decode("utf-8", errors="ignore")
+                                try:
+                                    raw = _gzip.decompress(raw).decode("utf-8")
+                                except Exception:
+                                    raw = raw.decode("utf-8", errors="ignore")
+
                             msg = json.loads(raw)
-                            if msg.get("ping"):
+
+                            # Responder al ping de BingX
+                            if "ping" in msg:
                                 await ws.send(json.dumps({"pong": msg["ping"]}))
                                 continue
-                            if "kline" in msg.get("dataType", "") and "data" in msg:
+
+                            # Datos de vela
+                            data_type = msg.get("dataType", "")
+                            if "kline" in data_type and "data" in msg:
                                 cb = self._ws_callbacks.get(key)
                                 if cb:
                                     items = msg["data"] if isinstance(msg["data"], list) else [msg["data"]]
@@ -178,7 +217,20 @@ class BingXClient:
                                         await cb(kline)
                         except Exception as e:
                             log.debug(f"WS parse {key}: {e}")
-            except Exception as e:
+
+            except (websockets.exceptions.InvalidStatusCode,
+                    websockets.exceptions.InvalidHandshake) as e:
+                ws_fails += 1
+                log.warning(f"WS rechazado {key} (intento {ws_fails}): {e}. Reintentando en {backoff}s…")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 120)
+            except (websockets.exceptions.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
+                ws_fails += 1
                 log.warning(f"WS desconectado {key}: {e}. Reconectando en {backoff}s…")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
+            except Exception as e:
+                ws_fails += 1
+                log.error(f"WS error inesperado {key}: {e}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 120)

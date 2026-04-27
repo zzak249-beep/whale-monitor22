@@ -38,6 +38,6 @@ AVOID_NEWS      = os.getenv("AVOID_NEWS", "true").lower() == "true"
 
 LOG_LEVEL     = os.getenv("LOG_LEVEL", "INFO")
 DRY_RUN       = os.getenv("DRY_RUN", "true").lower() == "true"
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "15"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
 
 CANDLES_REQUIRED = max(EMA_TREND_HTF, BOS_LOOKBACK) + 50
