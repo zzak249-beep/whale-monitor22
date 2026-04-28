@@ -1,12 +1,12 @@
+import os, sys
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 """
 BACKTESTER — Simulación histórica walk-forward sin lookahead bias
 ═════════════════════════════════════════════════════════════════
 Uso:
   python backtest.py --symbol BTC-USDT --days 90 --capital 10000
-
-Genera:
-  • Estadísticas completas (winrate, PF, RR, drawdown)
-  • CSV con todos los trades
 """
 import argparse
 import asyncio
