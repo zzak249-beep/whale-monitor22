@@ -1,3 +1,11 @@
+# ── PATH FIX: debe ir ANTES de cualquier otro import ──────────────────────────
+import os, sys
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+os.makedirs(os.path.join(_HERE, "logs"), exist_ok=True)
+# ──────────────────────────────────────────────────────────────────────────────
+
 """
 MAIN — Orquestador principal
 ══════════════════════════════════════════════════════════════════
@@ -11,13 +19,8 @@ Ciclo completo:
   7. Reporte diario a las 23:55 UTC
 """
 import asyncio
-import os
 import signal
-import sys
 from datetime import datetime, timezone
-
-os.makedirs("logs", exist_ok=True)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
 from exchange.bingx_client           import BingXClient
