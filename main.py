@@ -1,25 +1,28 @@
-# ── PATH FIX: debe ir ANTES de cualquier otro import ──────────────────────────
-import os, sys
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-os.makedirs(os.path.join(_HERE, "logs"), exist_ok=True)
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# PATH BOOTSTRAP — DEBE SER LO PRIMERO (antes de cualquier import)
+# ═══════════════════════════════════════════════════════════════════════════════
+import os as _os, sys as _sys
+_APP_DIR = _os.path.dirname(_os.path.abspath(__file__))
+for _p in (_APP_DIR, "/app", _os.getcwd()):
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
+_os.makedirs(_os.path.join(_APP_DIR, "logs"), exist_ok=True)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 """
 MAIN — Orquestador principal
 ══════════════════════════════════════════════════════════════════
-Ciclo completo:
-  1. Inicializar BingX, Telegram, RiskManager, PositionMonitor
-  2. Precargar velas históricas HTF + ENTRY (batch paralelo)
-  3. WebSocket en tiempo real (< 50ms) como fuente primaria
-  4. Polling REST como fallback cada POLL_INTERVAL segundos
-  5. Analizar señales → score → ejecutar si score ≥ MIN_SIGNAL_SCORE
-  6. Monitor de posiciones: trailing SL, cierre automático
-  7. Reporte diario a las 23:55 UTC
+1. Inicializar BingX, Telegram, RiskManager, PositionMonitor
+2. Precargar velas históricas HTF + ENTRY (batch paralelo)
+3. WebSocket en tiempo real (< 50ms) como fuente primaria
+4. Polling REST como fallback cada POLL_INTERVAL segundos
+5. Analizar señales → score → ejecutar si score ≥ MIN_SIGNAL_SCORE
+6. Monitor de posiciones: trailing SL, cierre automático
+7. Reporte diario a las 23:55 UTC
 """
 import asyncio
 import signal
+import sys
 from datetime import datetime, timezone
 
 import config
@@ -53,15 +56,13 @@ def _normalize(c) -> dict:
     return {k: (float(v) if k != "time" else int(v)) for k, v in c.items()}
 
 
-async def load_candles(symbol: str, interval: str,
-                       limit: int = None) -> list[dict]:
+async def load_candles(symbol: str, interval: str, limit: int = None) -> list[dict]:
     lim = limit or config.CANDLES_REQUIRED
     raw = await client.get_klines(symbol, interval, lim)
     return [_normalize(c) for c in raw if c]
 
 
 async def analyze_and_trade(symbol: str):
-    """Analiza señales y ejecuta órdenes si aplica."""
     if not RiskManager.is_trading_hour():
         return
 
@@ -71,12 +72,10 @@ async def analyze_and_trade(symbol: str):
     if len(htf_buf) < config.HTF_CANDLES_REQUIRED or len(entry_buf) < 50:
         return
 
-    # Cooldown entre señales del mismo símbolo
     buf_len = len(entry_buf)
     if buf_len - last_signal_bar.get(symbol, 0) < config.MIN_BARS_COOLDOWN:
         return
 
-    # ── Calcular indicadores ──────────────────────────────────────
     try:
         htf    = calculate_htf_bias(htf_buf)
         if not htf.confirmed:
@@ -94,21 +93,17 @@ async def analyze_and_trade(symbol: str):
     if signal.direction == "HOLD":
         return
 
-    # Actualizar cooldown
     last_signal_bar[symbol] = buf_len
 
-    # Notificar señal detectada
     tg.signal_detected(
         symbol, signal.direction, signal.score, signal.confidence,
         signal.entry_price, signal.stop_loss, signal.take_profit,
         signal.risk_reward, signal.reasons,
     )
 
-    # ── Chequeos de riesgo ────────────────────────────────────────
     balance = await client.get_balance()
     equity  = balance.get("equity", 0)
     if equity <= 0:
-        log.warning(f"{symbol}: balance inválido ({equity})")
         return
 
     can, reason = await risk.can_trade(symbol, equity)
@@ -116,7 +111,6 @@ async def analyze_and_trade(symbol: str):
         log.info(f"{symbol}: BLOQUEADO — {reason}")
         return
 
-    # ── Sizing ────────────────────────────────────────────────────
     sizing = risk.calculate_position_size(
         equity=equity,
         entry_price=signal.entry_price,
@@ -124,10 +118,8 @@ async def analyze_and_trade(symbol: str):
         size_mult=signal.size_mult,
     )
     if not sizing.valid:
-        log.warning(f"{symbol}: sizing inválido — {sizing.message}")
         return
 
-    # ── Ejecutar orden ────────────────────────────────────────────
     side     = "BUY"  if signal.direction == "LONG"  else "SELL"
     pos_side = "LONG" if signal.direction == "LONG"  else "SHORT"
 
@@ -159,37 +151,28 @@ async def analyze_and_trade(symbol: str):
 
 
 def make_ws_callback(symbol: str, interval: str):
-    """Fábrica de callbacks WebSocket por símbolo+TF."""
     async def on_kline(data: dict):
         kline     = data.get("k", data) if isinstance(data, dict) else {}
         is_closed = kline.get("x", kline.get("closed", False))
-
-        # Normalizar la vela del WS
         candle = {
-            "time":   int(kline.get("t", kline.get("time",   0))),
+            "time":   int(kline.get("t",  kline.get("time",   0))),
             "open":   float(kline.get("o", kline.get("open",  0))),
             "high":   float(kline.get("h", kline.get("high",  0))),
             "low":    float(kline.get("l", kline.get("low",   0))),
             "close":  float(kline.get("c", kline.get("close", 0))),
             "volume": float(kline.get("v", kline.get("volume",0))),
         }
-
         if not candle["time"] or not candle["close"]:
             return
 
         buf = candle_buffer.setdefault(symbol, {}).setdefault(interval, [])
-
-        # Actualizar o añadir la última vela
         if buf and buf[-1]["time"] == candle["time"]:
-            buf[-1] = candle  # actualizar vela actual en formación
+            buf[-1] = candle
         else:
             buf.append(candle)
-
-        # Mantener buffer acotado
         if len(buf) > config.CANDLES_REQUIRED + 50:
             del buf[0]
 
-        # Solo analizar en velas cerradas del TF de entrada
         if is_closed and interval == config.TF_ENTRY:
             log.debug(f"WS [{symbol} {interval}] close={candle['close']:.4f} ✓")
             await analyze_and_trade(symbol)
@@ -198,35 +181,29 @@ def make_ws_callback(symbol: str, interval: str):
 
 
 async def polling_loop(symbol: str):
-    """Fallback REST: recarga velas cada POLL_INTERVAL segundos."""
     while True:
         try:
-            # Cargar ambos TF en paralelo
-            htf_task   = load_candles(symbol, config.TF_HTF,   config.HTF_CANDLES_REQUIRED)
-            entry_task = load_candles(symbol, config.TF_ENTRY, config.CANDLES_REQUIRED)
-            htf_c, entry_c = await asyncio.gather(htf_task, entry_task)
-
+            htf_c, entry_c = await asyncio.gather(
+                load_candles(symbol, config.TF_HTF,   config.HTF_CANDLES_REQUIRED),
+                load_candles(symbol, config.TF_ENTRY, config.CANDLES_REQUIRED),
+            )
             if htf_c:
                 candle_buffer.setdefault(symbol, {})[config.TF_HTF]   = htf_c
             if entry_c:
                 candle_buffer.setdefault(symbol, {})[config.TF_ENTRY] = entry_c
-
             await analyze_and_trade(symbol)
-
         except Exception as e:
             log.error(f"Polling error {symbol}: {e}")
             tg.error_alert(f"Polling {symbol}: {str(e)[:200]}")
-
         await asyncio.sleep(config.POLL_INTERVAL)
 
 
 async def daily_report_loop():
-    """Reporte diario a las 23:55 UTC."""
     while True:
         now = datetime.now(timezone.utc)
         if now.hour == 23 and 55 <= now.minute <= 57:
             tg.daily_stats(risk.get_stats())
-            await asyncio.sleep(180)  # Evitar doble envío
+            await asyncio.sleep(180)
         await asyncio.sleep(30)
 
 
@@ -237,25 +214,28 @@ async def initialize():
     log.info(f"   Símbolos: {', '.join(config.SYMBOLS)}")
     log.info(f"   Riesgo: {config.RISK_PER_TRADE}% | Lev: {config.LEVERAGE}x | RR: {config.RISK_REWARD}x")
     log.info(f"   Score mínimo: {config.MIN_SIGNAL_SCORE}")
+    log.info(f"   sys.path[0]: {sys.path[0]}")
     log.info("=" * 62)
 
-    # Configurar apalancamiento
-    lev_tasks = [client.set_leverage(sym, config.LEVERAGE) for sym in config.SYMBOLS]
-    await asyncio.gather(*lev_tasks, return_exceptions=True)
+    await asyncio.gather(
+        *[client.set_leverage(sym, config.LEVERAGE) for sym in config.SYMBOLS],
+        return_exceptions=True,
+    )
 
-    # Precargar velas en paralelo (batch)
-    requests = []
-    for sym in config.SYMBOLS:
-        requests.append((sym, config.TF_HTF,   config.HTF_CANDLES_REQUIRED))
-        requests.append((sym, config.TF_ENTRY, config.CANDLES_REQUIRED))
-
-    batch = await client.get_klines_batch(requests)
+    batch = await client.get_klines_batch([
+        (sym, tf, lim)
+        for sym in config.SYMBOLS
+        for tf, lim in [
+            (config.TF_HTF,   config.HTF_CANDLES_REQUIRED),
+            (config.TF_ENTRY, config.CANDLES_REQUIRED),
+        ]
+    ])
     for sym in config.SYMBOLS:
         htf_c   = batch.get(f"{sym}_{config.TF_HTF}",   [])
         entry_c = batch.get(f"{sym}_{config.TF_ENTRY}", [])
         candle_buffer.setdefault(sym, {})[config.TF_HTF]   = htf_c
         candle_buffer.setdefault(sym, {})[config.TF_ENTRY] = entry_c
-        log.info(f"  Precargado {sym}: HTF={len(htf_c)} ENTRY={len(entry_c)} velas")
+        log.info(f"  {sym}: HTF={len(htf_c)} ENTRY={len(entry_c)} velas precargadas")
 
     await tg.start()
     tg.bot_started(config.SYMBOLS, config.DRY_RUN)
@@ -264,17 +244,13 @@ async def initialize():
 async def main():
     await initialize()
     tasks = []
-
     for sym in config.SYMBOLS:
-        # WebSocket streams
         if config.WS_ENABLED:
             for tf in [config.TF_HTF, config.TF_ENTRY]:
-                key = f"{sym}_{tf}"
-                client.register_ws_callback(key, make_ws_callback(sym, tf))
+                client.register_ws_callback(f"{sym}_{tf}", make_ws_callback(sym, tf))
                 tasks.append(asyncio.create_task(
                     client.stream_klines(sym, tf), name=f"ws_{sym}_{tf}"
                 ))
-        # Polling REST fallback
         tasks.append(asyncio.create_task(polling_loop(sym), name=f"poll_{sym}"))
 
     tasks.append(asyncio.create_task(pmon.run(),          name="position_monitor"))
@@ -291,7 +267,7 @@ async def main():
 
 
 def _sigterm(*_):
-    log.info("SIGTERM recibido — deteniendo…")
+    log.info("SIGTERM — deteniendo…")
     for t in asyncio.all_tasks():
         t.cancel()
 
