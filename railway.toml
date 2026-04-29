@@ -2,9 +2,6 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "PYTHONPATH=/app python main.py"
+startCommand = "python main.py"
 restartPolicyType = "always"
 restartPolicyMaxRetries = 10
-
-[deploy.envs]
-PYTHONPATH = "/app"
