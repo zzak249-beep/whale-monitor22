@@ -52,8 +52,13 @@ class BingXClient:
     async def top_symbols_by_volume(self, n: int = 20) -> list[str]:
         """Retorna los N pares USDT con mayor volumen en 24h."""
         data = await self._get("/openApi/swap/v2/quote/ticker")
-        # data es lista de tickers
-        usdt = [t for t in data if t["symbol"].endswith("-USDT")]
+        # El endpoint puede devolver lista o dict con clave "tickers"
+        if isinstance(data, dict):
+            logger.info(f"TICKER FORMAT (dict keys): {list(data.keys())}")
+            data = data.get("tickers", data.get("data", []))
+        elif isinstance(data, list) and data:
+            logger.info(f"TICKER FORMAT (list sample): {data[0]}")
+        usdt = [t for t in data if isinstance(t, dict) and t.get("symbol", "").endswith("-USDT")]
         usdt.sort(key=lambda t: float(t.get("quoteVolume", 0)), reverse=True)
         symbols = [t["symbol"] for t in usdt[:n]]
         logger.info(f"Top {n} pares: {symbols}")
@@ -92,9 +97,18 @@ class BingXClient:
 
     async def balance_usdt(self) -> float:
         data = await self._get("/openApi/swap/v2/user/balance", signed=True)
-        for asset in data.get("balance", []):
-            if asset["asset"] == "USDT":
-                return float(asset["availableMargin"])
+        logger.info(f"BALANCE RAW: {data}")
+        # BingX puede devolver dict con balance directo o lista
+        if isinstance(data, dict):
+            # Formato: {"balance": {"asset":"USDT", "availableMargin":"..."}}
+            b = data.get("balance", {})
+            if isinstance(b, dict):
+                return float(b.get("availableMargin", b.get("available", 0)))
+            # Formato: {"balance": [{"asset":"USDT", ...}]}
+            if isinstance(b, list):
+                for asset in b:
+                    if isinstance(asset, dict) and asset.get("asset") == "USDT":
+                        return float(asset.get("availableMargin", asset.get("available", 0)))
         return 0.0
 
     async def open_order(self, symbol: str, side: str, qty: float, tp_price: float, sl_price: float) -> str:
