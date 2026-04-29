@@ -1,7 +1,5 @@
-"""
-BINGX CLIENT — REST + WebSocket para futuros perpetuos
-"""
-import asyncio, hashlib, hmac, json, time
+"""BINGX CLIENT — REST + WebSocket para futuros perpetuos"""
+import asyncio, gzip, hashlib, hmac, json, time
 from typing import Any, Callable, Optional
 
 import aiohttp
@@ -27,8 +25,11 @@ class BingXClient:
 
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(limit=30, ttl_dns_cache=300, use_dns_cache=True)
             self._session = aiohttp.ClientSession(
-                headers={"X-BX-APIKEY": config.BINGX_API_KEY}
+                connector=connector,
+                headers={"X-BX-APIKEY": config.BINGX_API_KEY},
+                timeout=aiohttp.ClientTimeout(total=10, connect=5),
             )
         return self._session
 
@@ -45,30 +46,34 @@ class BingXClient:
         params = params or {}
         if signed:
             params = self._build_signed_params(params)
-        try:
-            async with self._get_session().get(
-                self.BASE + path, params=params,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
-                data = await r.json()
-                if isinstance(data, dict) and data.get("code", 0) != 0:
-                    log.warning(f"API error {path}: {data.get('msg', data)}")
-                return data
-        except Exception as e:
-            log.error(f"GET {path}: {e}")
-            return {}
+        for attempt in range(3):
+            try:
+                async with self._get_session().get(self.BASE + path, params=params) as r:
+                    if r.status == 429:
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+                    data = await r.json(content_type=None)
+                    if isinstance(data, dict) and data.get("code", 0) != 0:
+                        log.warning(f"API {path}: {data.get('msg', data)}")
+                    return data
+            except asyncio.TimeoutError:
+                await asyncio.sleep(0.5 * (attempt + 1))
+            except Exception as e:
+                log.error(f"GET {path}: {e}")
+                if attempt < 2:
+                    await asyncio.sleep(0.5)
+        return {}
 
     async def _post(self, path: str, params: dict = None) -> Any:
         params = self._build_signed_params(params or {})
-        try:
-            async with self._get_session().post(
-                self.BASE + path, params=params,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
-                return await r.json()
-        except Exception as e:
-            log.error(f"POST {path}: {e}")
-            return {}
+        for attempt in range(3):
+            try:
+                async with self._get_session().post(self.BASE + path, params=params) as r:
+                    return await r.json(content_type=None)
+            except Exception as e:
+                log.error(f"POST {path}: {e}")
+                await asyncio.sleep(0.5)
+        return {}
 
     async def get_klines(self, symbol: str, interval: str, limit: int = 300) -> list:
         params = {"symbol": symbol, "interval": interval, "limit": min(limit, 1440)}
@@ -77,12 +82,12 @@ class BingXClient:
         for c in (data.get("data", []) if isinstance(data, dict) else []):
             if isinstance(c, dict):
                 candles.append({
-                    "time":   int(c.get("time", c.get("t", 0))),
-                    "open":   float(c.get("open",  c.get("o", 0))),
-                    "high":   float(c.get("high",  c.get("h", 0))),
-                    "low":    float(c.get("low",   c.get("l", 0))),
-                    "close":  float(c.get("close", c.get("c", 0))),
-                    "volume": float(c.get("volume",c.get("v", 0))),
+                    "time":   int(c.get("time",   c.get("t",  0))),
+                    "open":   float(c.get("open",  c.get("o",  0))),
+                    "high":   float(c.get("high",  c.get("h",  0))),
+                    "low":    float(c.get("low",   c.get("l",  0))),
+                    "close":  float(c.get("close", c.get("c",  0))),
+                    "volume": float(c.get("volume",c.get("v",  0))),
                 })
             elif isinstance(c, list) and len(c) >= 6:
                 candles.append({
@@ -92,15 +97,23 @@ class BingXClient:
         candles.sort(key=lambda x: x["time"])
         return candles
 
+    async def get_klines_batch(self, requests: list) -> dict:
+        tasks = [self.get_klines(s, i, l) for s, i, l in requests]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return {
+            f"{req[0]}_{req[1]}": (res if not isinstance(res, Exception) else [])
+            for req, res in zip(requests, results)
+        }
+
     async def get_ticker(self, symbol: str) -> dict:
         data = await self._get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
         return data.get("data", {}) if isinstance(data, dict) else {}
 
     async def get_balance(self) -> dict:
         if config.DRY_RUN:
-            return {"equity": 10000.0, "available": 10000.0, "unrealizedProfit": 0.0}
+            return {"equity": 10_000.0, "available": 10_000.0, "unrealizedProfit": 0.0}
         data = await self._get("/openApi/swap/v2/user/balance", {}, signed=True)
-        bal = (data.get("data", {}) or {}).get("balance", {}) if isinstance(data, dict) else {}
+        bal  = ((data.get("data", {}) or {}).get("balance", {})) if isinstance(data, dict) else {}
         return {
             "equity":           float(bal.get("equity", 0)),
             "available":        float(bal.get("availableMargin", 0)),
@@ -124,21 +137,26 @@ class BingXClient:
         return {}
 
     async def place_order(self, symbol: str, side: str, position_side: str,
-                          qty: float, sl_price: float = 0.0, tp_price: float = 0.0,
-                          order_type: str = "MARKET") -> dict:
+                          qty: float, sl_price: float = 0.0, tp_price: float = 0.0) -> dict:
         if config.DRY_RUN:
             log.info(f"[DRY] {symbol} {side}/{position_side} qty={qty:.4f} SL={sl_price:.4f} TP={tp_price:.4f}")
             return {"orderId": f"DRY_{int(time.time())}", "status": "FILLED"}
         params: dict = {
             "symbol": symbol, "side": side, "positionSide": position_side,
-            "type": order_type, "quantity": qty,
+            "type": "MARKET", "quantity": qty,
         }
         if sl_price:
-            params["stopLoss"]   = json.dumps({"type": "STOP_MARKET", "stopPrice": sl_price, "price": sl_price, "workingType": "MARK_PRICE"})
+            params["stopLoss"] = json.dumps({
+                "type": "STOP_MARKET", "stopPrice": sl_price,
+                "price": sl_price, "workingType": "MARK_PRICE",
+            })
         if tp_price:
-            params["takeProfit"] = json.dumps({"type": "TAKE_PROFIT_MARKET", "stopPrice": tp_price, "price": tp_price, "workingType": "MARK_PRICE"})
-        data = await self._post("/openApi/swap/v2/trade/order", params)
-        order = (data.get("data", {}) or {}) if isinstance(data, dict) else {}
+            params["takeProfit"] = json.dumps({
+                "type": "TAKE_PROFIT_MARKET", "stopPrice": tp_price,
+                "price": tp_price, "workingType": "MARK_PRICE",
+            })
+        data  = await self._post("/openApi/swap/v2/trade/order", params)
+        order = ((data.get("data", {}) or {}) if isinstance(data, dict) else {})
         log.info(f"Orden: {symbol} {side} id={order.get('orderId','?')}")
         return order
 
@@ -151,86 +169,89 @@ class BingXClient:
 
     async def stream_klines(self, symbol: str, interval: str):
         """
-        Stream WebSocket BingX — perpetual swap market data.
-        Si el WS no está disponible, simplemente espera: el polling_loop
-        en main.py cubre los datos como fallback principal.
+        BingX Perpetual Swap WebSocket.
+        Endpoint correcto: wss://open-api.bingx.com/market
+        Protocolo: suscripción con dataType market.<symbol>.kline.<interval>
         """
-        import gzip as _gzip
         key     = f"{symbol}_{interval}"
         topic   = f"market.{symbol}.kline.{interval}"
-        # BingX swap perpetual WebSocket endpoint
+        # BingX swap perpetual market data WebSocket
         ws_url  = "wss://open-api.bingx.com/market"
         backoff = 10
-        ws_fails = 0
+        fails   = 0
 
         while True:
-            # Si ya falló muchas veces seguidas, solo dormir y dejar al polling
-            if ws_fails >= 5:
-                log.info(f"WS {key}: demasiados fallos, usando solo polling. Reintento en 5min…")
+            if fails >= 5:
+                log.info(f"WS {key}: demasiados fallos → solo polling (5min)")
                 await asyncio.sleep(300)
-                ws_fails = 0
+                fails = 0
+                backoff = 10
                 continue
             try:
-                extra_headers = {
-                    "User-Agent": "Mozilla/5.0",
-                }
                 async with websockets.connect(
                     ws_url,
-                    extra_headers=extra_headers,
-                    ping_interval=None,   # BingX maneja su propio ping
-                    open_timeout=15,
+                    ping_interval=None,   # BingX gestiona su propio heartbeat
+                    open_timeout=20,
                     close_timeout=5,
+                    max_size=2**20,
                 ) as ws:
-                    sub_msg = json.dumps({
+                    sub = json.dumps({
                         "id":       key,
                         "reqType":  "sub",
                         "dataType": topic,
                     })
-                    await ws.send(sub_msg)
-                    log.info(f"WS suscrito: {topic}")
-                    backoff  = 10
-                    ws_fails = 0
+                    await ws.send(sub)
+                    log.info(f"WS ✓ suscrito: {topic}")
+                    backoff = 10
+                    fails   = 0
+                    last_ping = asyncio.get_event_loop().time()
 
                     async for raw in ws:
                         try:
                             # BingX envía datos comprimidos con gzip
                             if isinstance(raw, bytes):
-                                try:
-                                    raw = _gzip.decompress(raw).decode("utf-8")
-                                except Exception:
-                                    raw = raw.decode("utf-8", errors="ignore")
+                                try:    raw = gzip.decompress(raw).decode("utf-8")
+                                except: raw = raw.decode("utf-8", errors="ignore")
 
                             msg = json.loads(raw)
 
-                            # Responder al ping de BingX
+                            # Heartbeat BingX
                             if "ping" in msg:
                                 await ws.send(json.dumps({"pong": msg["ping"]}))
+                                last_ping = asyncio.get_event_loop().time()
                                 continue
 
                             # Datos de vela
-                            data_type = msg.get("dataType", "")
-                            if "kline" in data_type and "data" in msg:
+                            dt = msg.get("dataType", "")
+                            if "kline" in dt and "data" in msg:
                                 cb = self._ws_callbacks.get(key)
                                 if cb:
                                     items = msg["data"] if isinstance(msg["data"], list) else [msg["data"]]
                                     for kline in items:
                                         await cb(kline)
+
+                            # Timeout manual si no hay ping en 60s
+                            if asyncio.get_event_loop().time() - last_ping > 60:
+                                log.warning(f"WS {key}: sin ping 60s, reconectando")
+                                break
+
                         except Exception as e:
                             log.debug(f"WS parse {key}: {e}")
 
             except (websockets.exceptions.InvalidStatusCode,
                     websockets.exceptions.InvalidHandshake) as e:
-                ws_fails += 1
-                log.warning(f"WS rechazado {key} (intento {ws_fails}): {e}. Reintentando en {backoff}s…")
+                fails += 1
+                log.warning(f"WS {key} rechazado (fallo {fails}/5): {e} → retry {backoff}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 120)
-            except (websockets.exceptions.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
-                ws_fails += 1
-                log.warning(f"WS desconectado {key}: {e}. Reconectando en {backoff}s…")
+            except (websockets.exceptions.ConnectionClosed,
+                    OSError, asyncio.TimeoutError) as e:
+                fails += 1
+                log.warning(f"WS {key} caído (fallo {fails}/5): {e} → retry {backoff}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
             except Exception as e:
-                ws_fails += 1
-                log.error(f"WS error inesperado {key}: {e}")
+                fails += 1
+                log.error(f"WS {key} error inesperado: {e}")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 120)
