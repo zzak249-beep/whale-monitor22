@@ -68,11 +68,27 @@ class BingXClient:
         raw = await self._get("/openApi/swap/v3/quote/klines", {
             "symbol": symbol, "interval": interval, "limit": limit
         })
-        return [
-            {"o": float(c["open"]), "h": float(c["high"]),
-             "l": float(c["low"]),  "c": float(c["close"]), "v": float(c["volume"])}
-            for c in raw
-        ]
+        if raw:
+            logger.info(f"KLINES FORMAT: {raw[0]}")
+        result = []
+        for c in raw:
+            if isinstance(c, dict):
+                result.append({
+                    "o": float(c.get("open", c.get("o", 0))),
+                    "h": float(c.get("high", c.get("h", 0))),
+                    "l": float(c.get("low",  c.get("l", 0))),
+                    "c": float(c.get("close", c.get("c", 0))),
+                    "v": float(c.get("volume", c.get("v", 0))),
+                })
+            elif isinstance(c, list) and len(c) >= 5:
+                result.append({
+                    "o": float(c[1]), "h": float(c[2]),
+                    "l": float(c[3]), "c": float(c[4]),
+                    "v": float(c[5]) if len(c) > 5 else 0.0,
+                })
+            else:
+                logger.warning(f"KLINES unexpected: {type(c)} = {c}")
+        return result
 
     async def balance_usdt(self) -> float:
         data = await self._get("/openApi/swap/v2/user/balance", signed=True)
