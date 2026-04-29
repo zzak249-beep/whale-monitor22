@@ -55,10 +55,10 @@ def signal(candles_15m: list[dict], candles_4h: list[dict]) -> Optional[str]:
     closes_4h = [c["c"] for c in candles_4h]
     ma20 = _sma(closes_4h, 20)
     valid_ma = [v for v in ma20 if v is not None]
-    if len(valid_ma) < 2:
+    if len(valid_ma) < 4:
         return None
-    ma_up   = valid_ma[-1] > valid_ma[-2]
-    ma_down = valid_ma[-1] < valid_ma[-2]
+    ma_up   = valid_ma[-1] > valid_ma[-4]
+    ma_down = valid_ma[-1] < valid_ma[-4]
 
     if not ma_up and not ma_down:
         return None  # MA plana, sin tendencia
