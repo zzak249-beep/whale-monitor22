@@ -17,5 +17,6 @@ RUN mkdir -p data
 # Railway injects PORT automatically
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONPATH=/app
 
 CMD ["python", "bot.py"]
