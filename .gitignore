@@ -1,3 +1,8 @@
 .env
-*.log
+data/
 __pycache__/
+*.pyc
+*.pyo
+.numba_cache/
+*.db
+*.log

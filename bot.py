@@ -1,154 +1,373 @@
+"""bot.py — UltraBot v3 main entry point.
+
+Fixes applied vs original Maki Bot:
+  - One-way mode orders (no ReduceOnly conflict, fixes error 109400)
+  - Full UltraBot v3 pipeline: ADX + RSI + Volume Delta multi-timeframe
+  - Trailing stop-loss via periodic position monitoring
+  - Graceful shutdown, DB persistence, Telegram alerts
 """
-Maki Bot — ZigZag + 20MA 4H para BingX Futures
-TP: +0.45% | SL: -0.30% | Todos los pares USDT en lotes de 50
-"""
+from __future__ import annotations
 import asyncio
-import logging
 import os
+import signal
+import time
 from datetime import datetime, timezone
 
-from bingx import BingXClient
-from strategy import signal, tp_sl
-import telegram
+from loguru import logger
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+from core.config import cfg
+from core.database import init_db, save_trade_open, save_trade_close, save_signal, get_performance_stats, get_recent_trades
+from core.risk import RiskManager
+from exchange.client import (
+    fetch_all_tickers, fetch_universe_concurrent,
+    get_balance, get_all_positions,
+    set_leverage, place_market_order, close_position,
+    cancel_all_orders, get_price, close_session,
 )
-logger = logging.getLogger("bot")
+from strategies.indicators import generate_signal
+from notifications.telegram import send, send_now, start_sender, msg_start, msg_entry, msg_close, msg_performance, msg_halt, msg_error
+from dashboard.server import start_dashboard, update_state
 
-API_KEY      = os.environ["BINGX_API_KEY"]
-API_SECRET   = os.environ["BINGX_API_SECRET"]
-TG_TOKEN     = os.environ["TELEGRAM_BOT_TOKEN"]
-TG_CHAT      = os.environ["TELEGRAM_CHAT_ID"]
-TRADE_USDT   = float(os.environ.get("TRADE_AMOUNT_USDT", "10"))
-MAX_TRADES   = int(os.environ.get("MAX_OPEN_TRADES", "3"))
-BATCH_PAUSE  = float(os.environ.get("BATCH_PAUSE_SECONDS", "2"))  # pausa entre lotes
+# ── Globals ───────────────────────────────────────────────────────────────────
 
-open_trades: dict = {}
+risk = RiskManager()
+_open_trades: dict[str, dict] = {}   # symbol → {trade_id, side, entry, sl, tp, sl_pct, tp_pct, size, opened_at, metrics}
+_running = True
 
 
-async def notify(text: str):
-    ok = await telegram.send(TG_TOKEN, TG_CHAT, text)
-    if not ok:
-        logger.error("Telegram send FAILED — revisa TG_TOKEN y TG_CHAT_ID")
+# ── Universe ──────────────────────────────────────────────────────────────────
 
-
-async def monitor(client: BingXClient):
-    for symbol, trade in list(open_trades.items()):
+async def get_universe() -> list[str]:
+    """Top N symbols by 24h volume, filtered by blacklist."""
+    tickers = await fetch_all_tickers()
+    filtered = []
+    for t in tickers:
+        sym = t.get("symbol", "")
+        if not sym.endswith("-USDT"):
+            continue
+        if sym in cfg.blacklist:
+            continue
         try:
-            ticker_data = await client._get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
-            price = float(ticker_data[0]["lastPrice"] if isinstance(ticker_data, list) else ticker_data["lastPrice"])
-            side  = trade["side"]
-            hit_tp = price >= trade["tp"] if side == "LONG" else price <= trade["tp"]
-            hit_sl = price <= trade["sl"] if side == "LONG" else price >= trade["sl"]
+            vol = float(t.get("quoteVolume", t.get("volume", 0)))
+        except Exception:
+            continue
+        if vol >= cfg.min_volume_usdt:
+            filtered.append((sym, vol))
 
-            if hit_tp or hit_sl:
-                reason = "TP ✅" if hit_tp else "SL ❌"
-                pnl = (price - trade["entry"]) * trade["qty"] if side == "LONG" else (trade["entry"] - price) * trade["qty"]
-                await client.close_position(symbol, side, trade["qty"])
-                del open_trades[symbol]
-                logger.info(f"Cerrado {symbol} {side} {reason} pnl={pnl:.2f}")
-                await notify(
-                    f"{'🟢' if hit_tp else '🔴'} *{reason} — {symbol}*\n"
-                    f"Dirección: `{side}`\n"
-                    f"Entrada: `{trade['entry']:.4f}` → Salida: `{price:.4f}`\n"
-                    f"PnL estimado: `{pnl:.2f} USDT`"
-                )
-        except Exception as e:
-            logger.warning(f"Error monitorizando {symbol}: {e}")
+    filtered.sort(key=lambda x: x[1], reverse=True)
+    symbols = [s for s, _ in filtered[: cfg.top_n_symbols]]
+    logger.info(f"Universe: {len(symbols)} symbols (min vol ${cfg.min_volume_usdt:,.0f})")
+    return symbols
 
 
-async def scan_batch(client: BingXClient, symbols: list[str]):
-    """Escanea una lista de símbolos en lotes de 50 con pausa entre lotes."""
-    BATCH = 50
-    for i in range(0, len(symbols), BATCH):
-        batch = symbols[i:i + BATCH]
-        logger.info(f"Escaneando lote {i//BATCH + 1}: {batch[0]} … {batch[-1]}")
+# ── Position monitoring ───────────────────────────────────────────────────────
 
-        for symbol in batch:
-            if symbol in open_trades:
-                continue
-            if len(open_trades) >= MAX_TRADES:
-                logger.info("Max trades alcanzado, pausando escaneo.")
-                return
-            try:
-                c15 = await client.klines(symbol, "15m", limit=60)
-                c4h = await client.klines(symbol, "4h",  limit=30)
-                sig = signal(c15, c4h, symbol=symbol)
-                if sig is None:
-                    continue
+async def monitor_positions() -> None:
+    """Check open positions for SL/TP hit and apply trailing SL."""
+    positions = await get_all_positions()
+    balance = await get_balance()
+    risk.set_balance(balance)
 
-                price = c15[-1]["c"]
-                tp, sl = tp_sl(price, sig)
-                qty = round(TRADE_USDT / price, 6)
+    for symbol, trade in list(_open_trades.items()):
+        pos = positions.get(symbol)
+        if pos is None:
+            # Position closed externally (exchange SL/TP hit)
+            price = await get_price(symbol)
+            await _close_trade(symbol, trade, price, "Exchange SL/TP", balance)
+            continue
 
-                await client.open_order(symbol, sig, qty, tp, sl)
-                open_trades[symbol] = {"side": sig, "entry": price, "tp": tp, "sl": sl, "qty": qty}
+        price = float(pos.get("markPrice", pos.get("entryPrice", 0)))
+        if price <= 0:
+            continue
 
-                emoji = "📈" if sig == "LONG" else "📉"
-                logger.info(f"Trade abierto: {symbol} {sig} @ {price:.4f}")
-                await notify(
-                    f"{emoji} *{sig} — {symbol}*\n"
-                    f"Entrada: `{price:.4f}`\n"
-                    f"TP: `{tp:.4f}` (+0.45%)\n"
-                    f"SL: `{sl:.4f}` (-0.30%)\n"
-                    f"Cantidad: `{qty}` | Monto: `{TRADE_USDT} USDT`"
-                )
-            except RuntimeError as e:
-                err = str(e)
-                logger.warning(f"Error orden {symbol}: {err}")
-                if any(k in err.lower() for k in ["insufficient", "balance", "margin", "1101", "2001"]):
-                    await notify(
-                        f"⚠️ *Señal detectada pero sin fondos*\n"
-                        f"Par: `{symbol}` | `{sig}`\n"
-                        f"Recarga tu wallet de Futuros en BingX."
-                    )
-                else:
-                    await notify(f"⚠️ *Error al abrir orden*\n`{symbol}`\n`{err[:200]}`")
-            except Exception as e:
-                logger.warning(f"Error escaneando {symbol}: {e}")
+        side   = trade["side"]
+        sl     = trade["sl"]
+        tp     = trade["tp"]
+        entry  = trade["entry"]
 
-        # Pausa entre lotes para respetar rate limit
-        await asyncio.sleep(BATCH_PAUSE)
+        # Check TP / SL hit (belt-and-suspenders over exchange orders)
+        hit_tp = (price >= tp) if side == "BUY" else (price <= tp)
+        hit_sl = (price <= sl) if side == "BUY" else (price >= sl)
+
+        if hit_tp or hit_sl:
+            reason = "TP" if hit_tp else "SL"
+            await cancel_all_orders(symbol)
+            await close_position(symbol, pos)
+            await _close_trade(symbol, trade, price, reason, balance)
+            continue
+
+        # Trailing stop-loss
+        if cfg.trailing_sl:
+            sl_pct = trade["sl_pct"]
+            if side == "BUY":
+                new_sl = round(price * (1 - sl_pct / 100), 8)
+                if new_sl > sl:
+                    _open_trades[symbol]["sl"] = new_sl
+                    logger.debug(f"Trailing SL {symbol}: {sl:.6g} → {new_sl:.6g}")
+            else:
+                new_sl = round(price * (1 + sl_pct / 100), 8)
+                if new_sl < sl:
+                    _open_trades[symbol]["sl"] = new_sl
+                    logger.debug(f"Trailing SL {symbol}: {sl:.6g} → {new_sl:.6g}")
 
 
-async def main():
-    client = BingXClient(API_KEY, API_SECRET)
+async def _close_trade(symbol: str, trade: dict, price: float, reason: str, balance: float) -> None:
+    entry  = trade["entry"]
+    side   = trade["side"]
+    size   = trade["size"]
 
-    balance = await client.balance_usdt()
-    symbols = await client.all_symbols()
+    if side == "BUY":
+        pnl_pct = (price - entry) / entry * 100 * cfg.leverage
+    else:
+        pnl_pct = (entry - price) / entry * 100 * cfg.leverage
 
-    logger.info(f"Balance: {balance:.2f} USDT | Pares totales: {len(symbols)}")
-    await notify(
-        f"🤖 *Maki Bot iniciado*\n"
-        f"Balance: `{balance:.2f} USDT`\n"
-        f"Monto/trade: `{TRADE_USDT} USDT`\n"
-        f"Pares: `{len(symbols)}` (todos)\n"
-        f"TP: +0.45% | SL: -0.30%\n"
-        f"Max trades: `{MAX_TRADES}`"
+    pnl = size * pnl_pct / 100
+
+    risk.record_close(symbol, pnl, balance)
+    _open_trades.pop(symbol, None)
+
+    await save_trade_close(
+        trade["trade_id"], price, pnl, pnl_pct,
+        reason, entry, trade["opened_at"]
     )
 
-    last_symbol_refresh = datetime.now(timezone.utc).hour
+    duration_s = int(time.time() - trade.get("opened_ts", time.time()))
+    await send(msg_close(symbol, side, pnl, pnl_pct, reason, duration_s))
+    logger.info(f"CLOSE {symbol} {side} @ {price:.6g} | {reason} | PnL {pnl:+.2f} USDT ({pnl_pct:+.2f}%)")
 
-    while True:
+
+# ── Scanning ──────────────────────────────────────────────────────────────────
+
+async def scan_symbols(symbols: list[str]) -> list[dict]:
+    """Fetch OHLCV for all symbols and run signal generation."""
+    t0 = time.time()
+    data = await fetch_universe_concurrent(symbols)
+    signals = []
+
+    for sym, ohlcv in data.items():
+        if sym in _open_trades:
+            continue
         try:
-            await monitor(client)
-            await scan_batch(client, symbols)
+            p = ohlcv["p"]
+            h = ohlcv.get("h")
+            t = ohlcv.get("t")
 
-            # Refrescar lista de pares cada hora
-            now_hour = datetime.now(timezone.utc).hour
-            if now_hour != last_symbol_refresh:
-                symbols = await client.all_symbols()
-                last_symbol_refresh = now_hour
-                logger.info(f"Pares actualizados: {len(symbols)}")
+            sig, metrics = generate_signal(
+                p["high"], p["low"], p["close"], p["open"], p["volume"],
+                h["high"] if h else None, h["low"] if h else None,
+                h["close"] if h else None, h["open"] if h else None,
+                h["volume"] if h else None,
+                t["high"] if t else None, t["low"] if t else None,
+                t["close"] if t else None,
+                cfg,
+            )
+
+            if sig and metrics.get("confidence", 0) >= cfg.min_confidence:
+                signals.append({"symbol": sym, "signal": sig, **metrics})
 
         except Exception as e:
-            logger.error(f"Error en loop: {e}")
-            await notify(f"⚠️ Error en bot: `{str(e)[:200]}`")
+            logger.debug(f"Signal error {sym}: {e}")
 
-        await asyncio.sleep(10)  # ciclo corto; el throttle real lo hace BATCH_PAUSE
+    elapsed = (time.time() - t0) * 1000
+    n_buy  = sum(1 for s in signals if s["signal"] == "BUY")
+    n_sell = sum(1 for s in signals if s["signal"] == "SELL")
+    logger.info(f"Scan {len(data)} symbols in {elapsed:.0f}ms — 🟢{n_buy} 🔴{n_sell} signals")
+
+    # Sort by confidence desc
+    signals.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+    return signals, elapsed, len(data)
+
+
+# ── Order execution ───────────────────────────────────────────────────────────
+
+async def execute_signal(sig_data: dict, balance: float) -> None:
+    symbol = sig_data["symbol"]
+    side   = sig_data["signal"]
+
+    # Gates
+    can, reason = risk.can_trade(balance)
+    if not can:
+        logger.debug(f"Skip {symbol}: {reason}")
+        return
+
+    if not risk.correlation_ok(symbol):
+        logger.debug(f"Skip {symbol}: correlation block")
+        return
+
+    if symbol in _open_trades:
+        return
+
+    # Get current price
+    price = await get_price(symbol)
+    if price <= 0:
+        return
+
+    n_open   = len(_open_trades)
+    conf     = sig_data.get("confidence", 50)
+    atr_pct  = sig_data.get("atr_pct", 1.0)
+    atr      = sig_data.get("atr", 0.0)
+    size     = risk.position_size(balance, n_open, conf, atr_pct)
+    sl, tp, sl_pct, tp_pct = risk.dynamic_sl_tp(price, side, atr)
+
+    # Set leverage (one-way mode compatible)
+    await set_leverage(symbol, cfg.leverage)
+
+    # Place order — ONE-WAY MODE (no positionSide, no ReduceOnly)
+    resp = await place_market_order(symbol, side, size, sl, tp)
+
+    if resp.get("code", 0) not in (0, None) and resp.get("code", 0) != 200:
+        err = resp.get("msg", str(resp))
+        logger.warning(f"Order failed {symbol}: {err}")
+        await send(msg_error(f"{symbol}: {err}"))
+        await save_signal(symbol, side, sig_data, executed=False)
+        return
+
+    # Record trade
+    metrics = {k: sig_data[k] for k in ("adx", "rsi", "atr_pct", "confidence", "delta1", "delta2", "delta3") if k in sig_data}
+    trade_id = await save_trade_open(symbol, side, price, 0, size, sl, tp, metrics)
+    await save_signal(symbol, side, sig_data, executed=True)
+
+    opened_at = datetime.now(timezone.utc).isoformat()
+    _open_trades[symbol] = {
+        "trade_id":  trade_id,
+        "side":      side,
+        "entry":     price,
+        "sl":        sl,
+        "tp":        tp,
+        "sl_pct":    sl_pct,
+        "tp_pct":    tp_pct,
+        "size":      size,
+        "opened_at": opened_at,
+        "opened_ts": time.time(),
+        "metrics":   metrics,
+    }
+    risk.record_open(symbol)
+
+    await send(msg_entry(symbol, side, price, size, sl, tp, sl_pct, tp_pct, {**metrics, "confidence": conf}))
+    logger.info(f"OPEN {symbol} {side} @ {price:.6g} | size={size:.1f} USDT | SL={sl:.6g} TP={tp:.6g} | conf={conf:.0f}%")
+
+
+# ── Dashboard state update ────────────────────────────────────────────────────
+
+async def push_dashboard(balance: float, signals: list[dict], elapsed_ms: float, n_scanned: int) -> None:
+    positions = await get_all_positions()
+    risk_summary = risk.summary()
+    perf = await get_performance_stats()
+
+    n_buy  = sum(1 for s in signals if s.get("signal") == "BUY")
+    n_sell = sum(1 for s in signals if s.get("signal") == "SELL")
+
+    trade_metrics = {sym: t["metrics"] for sym, t in _open_trades.items()}
+
+    update_state(
+        status       = "halted" if risk.is_halted else "running",
+        balance      = balance,
+        positions    = positions,
+        scan_stats   = {"last_ms": elapsed_ms, "n_scanned": n_scanned, "n_buy": n_buy, "n_sell": n_sell},
+        risk         = risk_summary,
+        perf         = perf,
+        last_signals = signals[:20],
+        trade_metrics= trade_metrics,
+    )
+
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+
+async def main() -> None:
+    global _running
+
+    logger.info("UltraBot v3 starting…")
+    os.makedirs("data", exist_ok=True)
+    await init_db()
+
+    if cfg.dashboard_enabled:
+        await start_dashboard()
+
+    start_sender()
+
+    # Initial universe
+    symbols = await get_universe()
+    balance = await get_balance()
+    risk.set_balance(balance)
+
+    await send_now(msg_start(len(symbols)))
+    logger.info(f"Balance: {balance:.2f} USDT | Universe: {len(symbols)} symbols")
+
+    # Perf report every 6h
+    last_perf_report = time.time()
+    # Universe refresh every hour
+    last_universe_refresh = time.time()
+
+    iteration = 0
+    while _running:
+        try:
+            # Refresh universe hourly
+            if time.time() - last_universe_refresh > 3600:
+                symbols = await get_universe()
+                last_universe_refresh = time.time()
+
+            # Monitor open positions
+            if _open_trades:
+                await monitor_positions()
+
+            # Update balance
+            balance = await get_balance()
+            risk.set_balance(balance)
+
+            if risk.is_halted:
+                await push_dashboard(balance, [], 0, 0)
+                if iteration % 30 == 0:
+                    await send(msg_halt(risk.summary().get("halt_reason", "unknown")))
+                await asyncio.sleep(cfg.scan_interval)
+                iteration += 1
+                continue
+
+            # Scan
+            signals, elapsed_ms, n_scanned = await scan_symbols(symbols)
+
+            # Execute top signals
+            for sig in signals[:3]:  # max 3 new trades per cycle
+                if len(_open_trades) >= cfg.max_open_trades:
+                    break
+                await execute_signal(sig, balance)
+
+            # Dashboard
+            await push_dashboard(balance, signals, elapsed_ms, n_scanned)
+
+            # Perf report every 6h
+            if time.time() - last_perf_report > 21600:
+                perf = await get_performance_stats()
+                await send(msg_performance(perf, risk.summary()))
+                last_perf_report = time.time()
+
+            await asyncio.sleep(cfg.scan_interval)
+            iteration += 1
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.exception(f"Main loop error: {e}")
+            await send(msg_error(str(e)))
+            await asyncio.sleep(30)
+
+    logger.info("Shutting down…")
+    await close_session()
+
+
+def _handle_signal(sig, frame):
+    global _running
+    logger.info(f"Received {sig}, stopping…")
+    _running = False
 
 
 if __name__ == "__main__":
+    import sys
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    # Configure loguru
+    logger.remove()
+    logger.add(sys.stdout, level="INFO", format="{time:HH:mm:ss} [{level}] {message}")
+    logger.add("data/bot.log", level="DEBUG", rotation="50 MB", retention="7 days")
+
     asyncio.run(main())

@@ -1,60 +1,67 @@
-# Maki Bot — BingX Futures
+# ⚡ UltraBot v3 — BingX Perpetual Futures
 
-Estrategia de @makitofx adaptada a crypto: ZigZag + 20MA en 4H.
+Multi-timeframe trading bot: ADX + RSI + 3-Step Volume Delta on 15m/1h/4h.
 
-| Parámetro | Valor |
-|-----------|-------|
-| Marco temporal | 15m (señal) + 4H (filtro) |
-| Take Profit | +0.45% del precio de entrada |
-| Stop Loss | -0.30% del precio de entrada |
-| Pares | Top 20 por volumen en BingX, actualizado cada hora |
-| Exchange | BingX Perpetual Futures |
+## CRITICAL: Before deploying
 
-## Deploy en Railway (5 pasos)
+### 1. Switch BingX to One-Way Mode
+BingX Futures → Settings → Position Mode → **One-way Mode**
+(Fixes error 109400 — Hedge mode conflicts with order parameters)
 
-**1. Claves BingX**
-- bingx.com → Perfil → Gestión de API → Nueva clave
-- Permisos: Futuros (lectura + trading). **Sin permisos de retiro.**
+### 2. API Key Permissions
+Enable: **Perpetual Futures Trading** (read + trade)
+Disable: withdrawals
 
-**2. Bot de Telegram**
-- Habla con `@BotFather` → `/newbot` → copia el token
-- Habla con `@userinfobot` → copia tu Chat ID
+---
 
-**3. Sube a GitHub**
-```bash
-git init && git add . && git commit -m "maki-bot"
-git remote add origin https://github.com/TU_USUARIO/maki-bot.git
-git push -u origin main
-```
+## Railway Deployment
 
-**4. Nuevo proyecto en Railway**
-- [railway.app](https://railway.app) → New Project → Deploy from GitHub repo
+1. Push this repo to GitHub
+2. New Railway project → Deploy from GitHub
+3. Add variables from `.env.example` in Railway → Variables tab
+4. Railway injects `PORT` automatically — dashboard available at your Railway URL
 
-**5. Variables de entorno en Railway**
-
-| Variable | Valor |
-|----------|-------|
-| `BINGX_API_KEY` | Tu API Key |
-| `BINGX_API_SECRET` | Tu API Secret |
-| `TELEGRAM_BOT_TOKEN` | Token de @BotFather |
-| `TELEGRAM_CHAT_ID` | Tu Chat ID |
-| `TRADE_AMOUNT_USDT` | `10` |
-| `MAX_OPEN_TRADES` | `3` |
-| `SCAN_INTERVAL_SECONDS` | `60` |
-| `TOP_N_SYMBOLS` | `20` |
-
-Deploy → el bot arranca en ~2 minutos y te manda un mensaje a Telegram.
-
-## Archivos
+## Project Structure
 
 ```
-src/
-  bot.py        # Loop principal (~80 líneas)
-  bingx.py      # Cliente API BingX
-  strategy.py   # Lógica ZigZag + 20MA 4H
-  telegram.py   # Envío de mensajes
+ultrabot/
+├── bot.py                  ← main entrypoint
+├── core/
+│   ├── config.py           ← all env var config
+│   ├── database.py         ← SQLite trade log
+│   └── risk.py             ← risk engine
+├── exchange/
+│   └── client.py           ← BingX API (one-way mode fixed)
+├── strategies/
+│   └── indicators.py       ← ADX/RSI/ATR/Volume Delta
+├── notifications/
+│   └── telegram.py         ← Telegram alerts
+├── dashboard/
+│   └── server.py           ← FastAPI WebSocket dashboard
+├── data/                   ← SQLite DB + logs (auto-created)
+├── requirements.txt
+├── Dockerfile
+└── railway.toml
 ```
 
-## Aviso
+## Strategy Logic
 
-Opera con dinero real. Empieza con `TRADE_AMOUNT_USDT=10` y revisa los logs en Railway → Logs antes de subir el monto.
+1. **Universe**: Top 50 symbols by 24h volume on BingX Perps
+2. **Signal**: ADX ≥ 25 + 2/3 Volume Delta steps aligned + RSI not overbought/oversold
+3. **HTF Filter**: 1h must not be in opposite trend (±20%)
+4. **Trend Filter**: 4h must not be strongly opposed (±50%)
+5. **Confidence Gate**: score ≥ 52 (ADX excess + vol spike bonus)
+6. **Sizing**: dynamic — confidence-scaled, slot-reduced, volatility-adjusted
+7. **SL/TP**: ATR-based dynamic (default 2% SL / 4% TP, ratio 1:2)
+8. **Trailing SL**: moves up with price to protect profits
+
+## Risk Parameters (recommended)
+
+| Param | Value | Reason |
+|-------|-------|--------|
+| LEVERAGE | 5x | Safe for volatile alts |
+| SL_PCT | 2.0% | ATR-adaptive minimum |
+| TP_PCT | 4.0% | 1:2 risk/reward |
+| MAX_OPEN_TRADES | 3 | Diversification |
+| DAILY_LOSS_LIMIT | 4.0% | Hard stop per day |
+| MAX_DRAWDOWN_PCT | 8.0% | Bot halts at this |
