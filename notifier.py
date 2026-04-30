@@ -6,7 +6,7 @@ from loguru import logger
 
 
 async def notify(text: str) -> None:
-    from core.config import cfg
+    from config import cfg
     if not cfg.telegram_token or not cfg.telegram_chat_id:
         return
     url = f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage"
