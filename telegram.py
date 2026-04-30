@@ -1,159 +1,181 @@
-"""notifications/telegram.py — Async Telegram notifications with rate limiting."""
-from __future__ import annotations
+"""Telegram notifications for trading alerts."""
 import asyncio
-import time
-from datetime import datetime, timezone
+import aiohttp
+from typing import Optional, Dict
 from loguru import logger
+from datetime import datetime
 
-_queue: asyncio.Queue[tuple[str, bool]] = asyncio.Queue(maxsize=200)
-_last_send: float = 0.0
-_MIN_INTERVAL = 0.5   # seconds between messages (Telegram limit: 30/sec)
+from core.config import cfg
 
 
-# ── Sender task ───────────────────────────────────────────────────────────────
+class TelegramSender:
+    """Async Telegram message sender with queue."""
+    
+    def __init__(self, token: str, chat_id: str):
+        self.token = token
+        self.chat_id = chat_id
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.running = False
+    
+    async def _init_session(self) -> None:
+        """Initialize HTTP session."""
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+    
+    async def send_message(self, text: str) -> bool:
+        """Send a message to Telegram."""
+        if not self.token or not self.chat_id:
+            logger.warning("Telegram not configured")
+            return False
+        
+        await self._init_session()
+        
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        data = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        
+        try:
+            async with self.session.post(url, json=data) as resp:
+                if resp.status == 200:
+                    logger.debug("Telegram message sent")
+                    return True
+                else:
+                    logger.warning(f"Telegram error: {resp.status}")
+                    return False
+        except Exception as e:
+            logger.error(f"Telegram send failed: {e}")
+            return False
+    
+    async def start(self) -> None:
+        """Start the message queue worker."""
+        self.running = True
+        while self.running:
+            try:
+                msg = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                await self.send_message(msg)
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"Queue worker error: {e}")
+    
+    async def queue_message(self, text: str) -> None:
+        """Add a message to the queue."""
+        await self.queue.put(text)
+    
+    async def close(self) -> None:
+        """Close the sender."""
+        self.running = False
+        if self.session:
+            await self.session.close()
+
+
+# Global telegram instance
+_sender: Optional[TelegramSender] = None
+
 
 def start_sender() -> None:
-    """Start the background Telegram sender coroutine."""
-    asyncio.create_task(_sender_loop())
+    """Start the Telegram sender."""
+    global _sender
+    if cfg.telegram_token and cfg.telegram_chat_id:
+        _sender = TelegramSender(cfg.telegram_token, cfg.telegram_chat_id)
+        asyncio.create_task(_sender.start())
+        logger.info("Telegram sender started")
 
 
-async def _sender_loop() -> None:
-    global _last_send
-    import aiohttp
-    from core.config import cfg
-
-    while True:
-        msg, silent = await _queue.get()
-        # Rate limit
-        gap = time.time() - _last_send
-        if gap < _MIN_INTERVAL:
-            await asyncio.sleep(_MIN_INTERVAL - gap)
-        try:
-            url = f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage"
-            payload = {
-                "chat_id":    cfg.telegram_chat_id,
-                "text":       msg[:4096],
-                "parse_mode": "HTML",
-                "disable_notification": silent,
-            }
-            async with aiohttp.ClientSession() as s:
-                async with s.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as r:
-                    if r.status != 200:
-                        body = await r.text()
-                        logger.warning(f"Telegram {r.status}: {body[:200]}")
-        except Exception as e:
-            logger.debug(f"Telegram send error: {e}")
-        finally:
-            _last_send = time.time()
-            _queue.task_done()
+async def send(text: str) -> None:
+    """Queue a message to be sent."""
+    if _sender:
+        await _sender.queue_message(text)
 
 
-async def send(msg: str, silent: bool = False) -> None:
-    """Queue a message (non-blocking)."""
-    try:
-        _queue.put_nowait((msg, silent))
-    except asyncio.QueueFull:
-        logger.debug("Telegram queue full — dropping message")
+async def send_now(text: str) -> None:
+    """Send a message immediately (blocking)."""
+    if _sender:
+        await _sender.send_message(text)
+    else:
+        logger.info(f"[TELEGRAM] {text}")
 
 
-async def send_now(msg: str) -> None:
-    """Fire-and-forget immediate send (bypasses queue)."""
-    from core.config import cfg
-    import aiohttp
-    try:
-        url = f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage"
-        payload = {
-            "chat_id": cfg.telegram_chat_id,
-            "text": msg[:4096],
-            "parse_mode": "HTML",
-        }
-        async with aiohttp.ClientSession() as s:
-            await s.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=8))
-    except Exception as e:
-        logger.debug(f"send_now error: {e}")
-
-
-# ── Message builders ──────────────────────────────────────────────────────────
-
-def _bar(confidence: float) -> str:
-    filled = int(confidence / 10)
-    return "█" * filled + "░" * (10 - filled)
-
-
+# Message formatters
 def msg_start(n_symbols: int) -> str:
-    from core.config import cfg
-    return (
-        f"⚡ <b>UltraBot v3 — Online</b>\n\n"
-        f"📊 Universe: <b>{n_symbols} symbols</b>\n"
-        f"⏱ Timeframe: {cfg.timeframe} / {cfg.confirm_tf} / {cfg.trend_tf}\n"
-        f"🎯 Period: {cfg.period} | ADX≥{cfg.adx_thresh} | RSI OB/OS {cfg.rsi_ob}/{cfg.rsi_os}\n"
-        f"⚖️ Leverage: {cfg.leverage}x | Risk: {cfg.risk_pct}% | Max trades: {cfg.max_open_trades}\n"
-        f"🛡 SL: {cfg.sl_pct}% | TP: {cfg.tp_pct}% | Trailing: {cfg.trailing_sl}\n"
-        f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
-    )
+    """Format startup message."""
+    return f"""
+🤖 <b>UltraBot v3 Starting</b>
+━━━━━━━━━━━━━━━━━━
+📊 Universe: {n_symbols} symbols
+⏰ Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+🚀 Status: <b>LIVE</b>
+"""
 
 
 def msg_entry(
     symbol: str, side: str, price: float, size: float,
-    sl: float, tp: float, sl_pct: float, tp_pct: float, metrics: dict
+    sl: float, tp: float, sl_pct: float, tp_pct: float,
+    metrics: Dict
 ) -> str:
-    emoji = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
-    conf  = metrics.get("confidence", 0)
-    return (
-        f"{emoji} <b>{symbol}</b>\n\n"
-        f"💰 Entry: <code>{price:.6g}</code>\n"
-        f"🎯 TP: <code>{tp:.6g}</code> (+{tp_pct:.1f}%)\n"
-        f"🛡 SL: <code>{sl:.6g}</code> (-{sl_pct:.1f}%)\n"
-        f"📦 Size: <b>{size:.1f} USDT</b>\n\n"
-        f"📈 ADX: {metrics.get('adx', 0):.1f} | "
-        f"+DI: {metrics.get('plus_di', 0):.1f} | "
-        f"-DI: {metrics.get('minus_di', 0):.1f}\n"
-        f"📊 RSI: {metrics.get('rsi', 0):.1f} | "
-        f"ATR: {metrics.get('atr_pct', 0):.2f}%\n"
-        f"🔵 Δ1: {metrics.get('delta1', 0):+.0f} | "
-        f"Δ2: {metrics.get('delta2', 0):+.0f} | "
-        f"Δ3: {metrics.get('delta3', 0):+.0f}\n"
-        f"⚡ Confidence: {conf:.0f}% {_bar(conf)}"
-    )
+    """Format entry message."""
+    emoji = "🟢" if side == "BUY" else "🔴"
+    conf = metrics.get("confidence", 0)
+    return f"""
+{emoji} <b>{side} ENTRY</b>
+━━━━━━━━━━━━━━━━━━
+💱 {symbol}
+💰 Price: ${price:.8g}
+📊 Size: {size:.2f} USDT
+🎯 SL: ${sl:.8g} ({-sl_pct:.2f}%)
+🏆 TP: ${tp:.8g} (+{tp_pct:.2f}%)
+📈 Confidence: {conf:.0f}%
+"""
 
 
 def msg_close(
     symbol: str, side: str, pnl: float, pnl_pct: float,
     reason: str, duration_s: int
 ) -> str:
-    pnl_emoji  = "💚" if pnl >= 0 else "🔴"
-    side_emoji = "🟢" if side == "LONG" else "🔴"
-    mins = duration_s // 60
-    return (
-        f"{pnl_emoji} <b>{symbol}</b> {side_emoji} {side} — <b>{reason}</b>\n\n"
-        f"PnL: <b>{pnl:+.2f} USDT</b> ({pnl_pct:+.2f}%)\n"
-        f"Duration: {mins}m"
-    )
+    """Format close message."""
+    emoji = "✅" if pnl >= 0 else "❌"
+    return f"""
+{emoji} <b>{reason}</b>
+━━━━━━━━━━━━━━━━━━
+💱 {symbol}
+💰 PnL: {pnl:+.2f} USDT ({pnl_pct:+.2f}%)
+⏱️ Duration: {duration_s // 60}m {duration_s % 60}s
+"""
 
 
-def msg_performance(perf: dict, risk: dict) -> str:
-    return (
-        f"📊 <b>Performance Report</b>\n\n"
-        f"Trades: {perf.get('total_trades', 0)} | "
-        f"WR: {perf.get('win_rate', 0):.1f}%\n"
-        f"Total PnL: <b>{perf.get('total_pnl', 0):+.2f} USDT</b>\n"
-        f"Avg Win: +{perf.get('avg_win', 0):.2f} | "
-        f"Avg Loss: {perf.get('avg_loss', 0):.2f}\n"
-        f"Best: {perf.get('best_trade', 0):+.2f} | "
-        f"Worst: {perf.get('worst_trade', 0):+.2f}\n"
-        f"Avg duration: {perf.get('avg_duration_m', 0):.0f}m\n\n"
-        f"💰 Balance: {risk.get('balance', 0):.2f} USDT | "
-        f"Day PnL: {risk.get('daily_pnl_usdt', 0):+.2f}"
-    )
+def msg_performance(perf: Dict, risk: Dict) -> str:
+    """Format performance report message."""
+    return f"""
+📊 <b>6-Hour Performance Report</b>
+━━━━━━━━━━━━━━━━━━
+✅ Wins: {perf.get('wins', 0)}
+❌ Losses: {perf.get('losses', 0)}
+📈 Win Rate: {perf.get('win_rate', 0):.1f}%
+💰 Total PnL: {perf.get('total_pnl', 0):+.2f} USDT
+📊 Avg/Trade: {perf.get('avg_trade', 0):+.2f} USDT
+⚠️ Daily PnL: {risk.get('daily_pnl', 0):+.2f} USDT
+"""
 
 
 def msg_halt(reason: str) -> str:
-    return f"🚨 <b>BOT HALTED</b>\n\nReason: {reason}"
-
-
-def msg_cooldown(seconds: int, consec: int) -> str:
-    return f"⏸ Cooldown {seconds}s ({consec} consecutive losses)"
+    """Format halt message."""
+    return f"""
+🛑 <b>BOT HALTED</b>
+━━━━━━━━━━━━━━━━━━
+⚠️ Reason: {reason}
+⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
 
 
 def msg_error(error: str) -> str:
-    return f"⚠️ Error: <code>{error[:300]}</code>"
+    """Format error message."""
+    return f"""
+❌ <b>ERROR</b>
+━━━━━━━━━━━━━━━━━━
+📌 {error}
+⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""

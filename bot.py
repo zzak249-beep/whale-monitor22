@@ -9,9 +9,14 @@ Fixes applied vs original Maki Bot:
 from __future__ import annotations
 import asyncio
 import os
+import sys
 import signal
 import time
 from datetime import datetime, timezone
+from pathlib import Path
+
+# Agregar directorio raíz al path para resolver imports
+sys.path.insert(0, str(Path(__file__).parent))
 
 from loguru import logger
 
@@ -361,7 +366,6 @@ def _handle_signal(sig, frame):
 
 
 if __name__ == "__main__":
-    import sys
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 

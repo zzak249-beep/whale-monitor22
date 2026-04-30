@@ -1,244 +1,392 @@
-"""dashboard/server.py — FastAPI + WebSocket live dashboard."""
-from __future__ import annotations
+"""Dashboard web server for real-time monitoring."""
 import asyncio
 import json
-import time
-from typing import Any
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
-import uvicorn
+from typing import Dict, Any, Optional
+from datetime import datetime
 from loguru import logger
 
-app = FastAPI(title="UltraBot Dashboard")
-
-_state: dict[str, Any] = {
-    "status": "starting",
-    "balance": 0.0,
-    "positions": {},
-    "scan_stats": {},
-    "risk": {},
-    "perf": {},
-    "last_signals": [],
-    "trade_metrics": {},
-    "updated_at": time.time(),
-}
-_clients: list[WebSocket] = []
+from core.config import cfg
 
 
-def update_state(**kwargs: Any) -> None:
-    _state.update(kwargs)
-    _state["updated_at"] = time.time()
+class DashboardState:
+    """Current state of the dashboard."""
+    
+    def __init__(self):
+        self.status: str = "initializing"
+        self.balance: float = 0.0
+        self.positions: Dict = {}
+        self.scan_stats: Dict = {}
+        self.risk: Dict = {}
+        self.perf: Dict = {}
+        self.last_signals: list = []
+        self.trade_metrics: Dict = {}
+        self.last_update: str = datetime.now().isoformat()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "status": self.status,
+            "balance": self.balance,
+            "positions": self.positions,
+            "scan_stats": self.scan_stats,
+            "risk": self.risk,
+            "perf": self.perf,
+            "last_signals": self.last_signals,
+            "trade_metrics": self.trade_metrics,
+            "last_update": self.last_update,
+        }
 
 
-_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>⚡ UltraBot v3</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg: #070b10;
-    --surface: #0d1520;
-    --surface2: #131c2a;
-    --border: #1e2d40;
-    --accent: #00d4ff;
-    --green: #00e676;
-    --red: #ff3d57;
-    --text: #e0eaf5;
-    --muted: #5a7a9a;
-    --warn: #ffb300;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font-family: 'Space Grotesk', sans-serif; font-size: 14px; }
-  code, .mono { font-family: 'JetBrains Mono', monospace; }
-
-  header {
-    background: var(--surface);
-    border-bottom: 1px solid var(--border);
-    padding: 14px 24px;
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    position: sticky; top: 0; z-index: 10;
-  }
-  .logo { font-size: 20px; font-weight: 600; color: var(--accent); letter-spacing: -0.5px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(0,230,118,.4)} 50%{opacity:.8;box-shadow:0 0 0 6px rgba(0,230,118,0)} }
-  .badge { padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; letter-spacing: .05em; }
-  .badge.running { background: rgba(0,212,255,.15); color: var(--accent); border: 1px solid rgba(0,212,255,.3); }
-  .badge.halted  { background: rgba(255,61,87,.15);  color: var(--red);   border: 1px solid rgba(255,61,87,.3); }
-  .ts { margin-left: auto; color: var(--muted); font-size: 12px; font-family: 'JetBrains Mono', monospace; }
-
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px,1fr)); gap: 12px; padding: 20px 24px 0; }
-  .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 16px;
-    position: relative;
-    overflow: hidden;
-  }
-  .card::after { content:''; position:absolute; top:0; left:0; right:0; height:2px; background: linear-gradient(90deg, var(--accent), transparent); opacity:.4; }
-  .card .lbl { font-size: 10px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); }
-  .card .val { font-size: 26px; font-weight: 600; margin-top: 6px; font-family: 'JetBrains Mono', monospace; }
-  .card .sub { font-size: 11px; color: var(--muted); margin-top: 3px; }
-  .green { color: var(--green) !important; }
-  .red   { color: var(--red) !important; }
-  .accent{ color: var(--accent) !important; }
-
-  section { margin: 16px 24px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
-  section h2 {
-    padding: 12px 16px;
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: .1em;
-    color: var(--muted);
-    border-bottom: 1px solid var(--border);
-  }
-  table { width: 100%; border-collapse: collapse; }
-  th { padding: 10px 14px; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 500; text-align: left; }
-  td { padding: 10px 14px; border-top: 1px solid var(--border); font-size: 13px; }
-  tr:hover td { background: var(--surface2); }
-  .empty { text-align: center; color: var(--muted); padding: 24px; font-size: 13px; }
-
-  .spark { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 4px; }
-  .spark.buy  { background: var(--green); box-shadow: 0 0 4px var(--green); }
-  .spark.sell { background: var(--red);   box-shadow: 0 0 4px var(--red); }
-</style>
-</head>
-<body>
-<header>
-  <div class="dot" id="status-dot"></div>
-  <div class="logo">⚡ UltraBot v3</div>
-  <span id="badge" class="badge running">RUNNING</span>
-  <span class="ts" id="updated"></span>
-</header>
-
-<div class="grid" id="metrics"></div>
-
-<section>
-  <h2>Open Positions</h2>
-  <table><thead>
-    <tr><th>Symbol</th><th>Side</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Conf%</th><th>ADX</th></tr>
-  </thead><tbody id="positions-body"></tbody></table>
-</section>
-
-<section>
-  <h2>Latest Signals</h2>
-  <table><thead>
-    <tr><th>Symbol</th><th>Signal</th><th>Conf%</th><th>ADX</th><th>RSI</th><th>ATR%</th><th>Vol</th></tr>
-  </thead><tbody id="signals-body"></tbody></table>
-</section>
-
-<script>
-const ws = new WebSocket((location.protocol==='https:'?'wss':'ws') + '://' + location.host + '/ws');
-ws.onmessage = e => render(JSON.parse(e.data));
-ws.onclose = () => {
-  document.getElementById('status-dot').style.background = 'var(--red)';
-  setTimeout(() => location.reload(), 5000);
-};
-
-function pC(v) { return parseFloat(v) >= 0 ? 'green' : 'red'; }
-function fmt(v, d=4) { return parseFloat(v||0).toFixed(d); }
-
-function render(d) {
-  const r = d.risk || {}, s = d.scan_stats || {}, p = d.perf || {};
-  document.getElementById('updated').textContent = new Date(d.updated_at*1000).toLocaleTimeString();
-
-  const badge = document.getElementById('badge');
-  badge.textContent = r.halted ? 'HALTED' : 'RUNNING';
-  badge.className   = 'badge ' + (r.halted ? 'halted' : 'running');
-
-  const metrics = [
-    { lbl:'Balance',      val:'$'+(d.balance||0).toFixed(2), sub:'USDT available' },
-    { lbl:'Day PnL',      val:(r.daily_pnl_usdt>=0?'+':'')+((r.daily_pnl_usdt)||0).toFixed(2), cls:pC(r.daily_pnl_usdt), sub:'USDT today' },
-    { lbl:'Total PnL',    val:(r.total_pnl>=0?'+':'')+(r.total_pnl||0).toFixed(2), cls:pC(r.total_pnl), sub:'all time' },
-    { lbl:'Win Rate',     val:(r.win_rate||0)+'%', sub:(r.wins||0)+'W / '+(r.losses||0)+'L' },
-    { lbl:'Open Trades',  val:Object.keys(d.positions||{}).length, sub:'of '+(r.max_open||3)+' max' },
-    { lbl:'Scan Speed',   val:(s.last_ms||0).toFixed(0)+'ms', sub:(s.n_scanned||0)+' symbols' },
-    { lbl:'Signals',      val:'↑'+(s.n_buy||0)+' ↓'+(s.n_sell||0), sub:'this scan', cls:'accent' },
-    { lbl:'Trades',       val:p.total_trades||0, sub:'avg '+(p.avg_duration_m||0).toFixed(0)+'m hold' },
-  ];
-
-  document.getElementById('metrics').innerHTML = metrics.map(m =>
-    `<div class="card"><div class="lbl">${m.lbl}</div>
-     <div class="val mono ${m.cls||''}">${m.val}</div>
-     <div class="sub">${m.sub||''}</div></div>`
-  ).join('');
-
-  const positions = d.positions || {};
-  const posRows = Object.entries(positions).map(([sym, pos]) => {
-    const pnl  = parseFloat(pos.unrealizedProfit||0);
-    const amt  = parseFloat(pos.positionAmt||0);
-    const side = amt > 0 ? 'LONG' : 'SHORT';
-    const m    = (d.trade_metrics||{})[sym] || {};
-    return `<tr>
-      <td class="mono">${sym}</td>
-      <td><span class="spark ${amt>0?'buy':'sell'}"></span>${side}</td>
-      <td class="mono">${fmt(pos.entryPrice,4)}</td>
-      <td class="mono">${fmt(pos.markPrice||pos.entryPrice,4)}</td>
-      <td class="mono ${pC(pnl)}">${pnl>=0?'+':''}${pnl.toFixed(2)}</td>
-      <td>${(m.confidence||0).toFixed(0)}%</td>
-      <td>${(m.adx||0).toFixed(1)}</td>
-    </tr>`;
-  }).join('') || `<tr><td colspan="7" class="empty">No open positions</td></tr>`;
-  document.getElementById('positions-body').innerHTML = posRows;
-
-  const sigRows = (d.last_signals||[]).slice(0,15).map(s =>
-    `<tr>
-      <td class="mono">${s.symbol}</td>
-      <td><span class="spark ${s.signal==='BUY'?'buy':'sell'}"></span><span class="${s.signal==='BUY'?'green':'red'}">${s.signal}</span></td>
-      <td>${(s.confidence||0).toFixed(0)}%</td>
-      <td>${(s.adx||0).toFixed(1)}</td>
-      <td>${(s.rsi||0).toFixed(1)}</td>
-      <td>${(s.atr_pct||0).toFixed(2)}%</td>
-      <td>${s.vol_spike?'<span class="accent">SPIKE</span>':'-'}</td>
-    </tr>`
-  ).join('') || `<tr><td colspan="7" class="empty">No signals yet</td></tr>`;
-  document.getElementById('signals-body').innerHTML = sigRows;
-}
-</script>
-</body>
-</html>"""
+# Global dashboard state
+_state = DashboardState()
 
 
-@app.get("/")
-async def index() -> HTMLResponse:
-    return HTMLResponse(_HTML)
+def update_state(
+    status: str = None,
+    balance: float = None,
+    positions: Dict = None,
+    scan_stats: Dict = None,
+    risk: Dict = None,
+    perf: Dict = None,
+    last_signals: list = None,
+    trade_metrics: Dict = None,
+) -> None:
+    """Update dashboard state."""
+    global _state
+    
+    if status is not None:
+        _state.status = status
+    if balance is not None:
+        _state.balance = balance
+    if positions is not None:
+        _state.positions = positions
+    if scan_stats is not None:
+        _state.scan_stats = scan_stats
+    if risk is not None:
+        _state.risk = risk
+    if perf is not None:
+        _state.perf = perf
+    if last_signals is not None:
+        _state.last_signals = last_signals
+    if trade_metrics is not None:
+        _state.trade_metrics = trade_metrics
+    
+    _state.last_update = datetime.now().isoformat()
 
 
-@app.get("/health")
-async def health() -> dict:
-    return {"status": "ok", "updated_at": _state["updated_at"]}
-
-
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket) -> None:
-    await ws.accept()
-    _clients.append(ws)
-    try:
-        await ws.send_text(json.dumps(_state, default=str))
-        while True:
-            await asyncio.sleep(2)
-            await ws.send_text(json.dumps(_state, default=str))
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
-    finally:
-        if ws in _clients:
-            _clients.remove(ws)
+def get_state() -> Dict[str, Any]:
+    """Get current state."""
+    return _state.to_dict()
 
 
 async def start_dashboard() -> None:
-    from core.config import cfg
-    port = cfg.effective_port
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning", access_log=False)
-    server = uvicorn.Server(config)
-    asyncio.create_task(server.serve())
-    logger.info(f"Dashboard → http://0.0.0.0:{port}")
+    """Start the dashboard server."""
+    try:
+        from aiohttp import web
+        
+        async def handle_api(request):
+            """API endpoint for dashboard data."""
+            return web.json_response(get_state())
+        
+        async def handle_home(request):
+            """Serve dashboard HTML."""
+            html = _get_dashboard_html()
+            return web.Response(text=html, content_type="text/html")
+        
+        app = web.Application()
+        app.router.add_get("/", handle_home)
+        app.router.add_get("/api/state", handle_api)
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", cfg.dashboard_port)
+        await site.start()
+        
+        logger.info(f"Dashboard started on http://0.0.0.0:{cfg.dashboard_port}")
+    
+    except ImportError:
+        logger.warning("aiohttp not installed, dashboard disabled")
+    except Exception as e:
+        logger.error(f"Dashboard start failed: {e}")
+
+
+def _get_dashboard_html() -> str:
+    """Generate dashboard HTML."""
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UltraBot v3 Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #0a0e27 0%, #1a1a2e 100%);
+            color: #e0e0e0;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        header {
+            text-align: center;
+            margin-bottom: 30px;
+            border-bottom: 2px solid #00ff88;
+            padding-bottom: 20px;
+        }
+        
+        h1 {
+            font-size: 2.5em;
+            color: #00ff88;
+            text-shadow: 0 0 10px rgba(0, 255, 136, 0.5);
+        }
+        
+        .status {
+            display: inline-block;
+            padding: 8px 16px;
+            border-radius: 20px;
+            margin-top: 10px;
+            font-weight: bold;
+        }
+        
+        .status.running {
+            background: #00ff88;
+            color: #000;
+        }
+        
+        .status.halted {
+            background: #ff4444;
+            color: #fff;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(0, 255, 136, 0.3);
+            border-radius: 10px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+        }
+        
+        .card h3 {
+            color: #00ff88;
+            margin-bottom: 15px;
+            font-size: 1.2em;
+        }
+        
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(0, 255, 136, 0.1);
+        }
+        
+        .metric-label {
+            color: #999;
+        }
+        
+        .metric-value {
+            color: #00ff88;
+            font-weight: bold;
+        }
+        
+        .metric-value.negative {
+            color: #ff4444;
+        }
+        
+        .metric-value.positive {
+            color: #00ff88;
+        }
+        
+        .last-update {
+            text-align: center;
+            color: #666;
+            font-size: 0.9em;
+            margin-top: 20px;
+        }
+        
+        .refresh-button {
+            background: #00ff88;
+            color: #000;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: bold;
+            margin-top: 10px;
+            transition: all 0.3s;
+        }
+        
+        .refresh-button:hover {
+            background: #00dd77;
+            transform: scale(1.05);
+        }
+        
+        .positions-list {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        
+        .position-item {
+            background: rgba(0, 255, 136, 0.1);
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 5px;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🤖 UltraBot v3</h1>
+            <div class="status" id="status">Loading...</div>
+        </header>
+        
+        <div class="grid">
+            <div class="card">
+                <h3>💰 Balance</h3>
+                <div class="metric">
+                    <span class="metric-label">Total USDT</span>
+                    <span class="metric-value" id="balance">0.00</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>📊 Performance</h3>
+                <div class="metric">
+                    <span class="metric-label">Total Trades</span>
+                    <span class="metric-value" id="total_trades">0</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Win Rate</span>
+                    <span class="metric-value" id="win_rate">0%</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Total PnL</span>
+                    <span class="metric-value" id="total_pnl">0.00</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>⚠️ Risk</h3>
+                <div class="metric">
+                    <span class="metric-label">Open Positions</span>
+                    <span class="metric-value" id="open_positions">0</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Daily PnL</span>
+                    <span class="metric-value" id="daily_pnl">0.00</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>🔍 Scan</h3>
+                <div class="metric">
+                    <span class="metric-label">Last Scan</span>
+                    <span class="metric-value" id="last_scan">0ms</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">BUY Signals</span>
+                    <span class="metric-value positive" id="buy_signals">0</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">SELL Signals</span>
+                    <span class="metric-value negative" id="sell_signals">0</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h3>📈 Open Positions</h3>
+            <div class="positions-list" id="positions_list">
+                <p style="color: #666;">No open positions</p>
+            </div>
+        </div>
+        
+        <div class="last-update">
+            Last updated: <span id="last_update">-</span>
+            <button class="refresh-button" onclick="refreshData()">Refresh Now</button>
+        </div>
+    </div>
+    
+    <script>
+        async function refreshData() {
+            try {
+                const response = await fetch('/api/state');
+                const data = await response.json();
+                updateDashboard(data);
+            } catch (error) {
+                console.error('Error fetching data:', error);
+            }
+        }
+        
+        function updateDashboard(data) {
+            // Status
+            const statusEl = document.getElementById('status');
+            statusEl.textContent = data.status.toUpperCase();
+            statusEl.className = 'status ' + data.status;
+            
+            // Balance
+            document.getElementById('balance').textContent = data.balance.toFixed(2);
+            
+            // Performance
+            document.getElementById('total_trades').textContent = data.perf.total_trades || 0;
+            document.getElementById('win_rate').textContent = (data.perf.win_rate || 0).toFixed(1) + '%';
+            const totalPnL = document.getElementById('total_pnl');
+            totalPnL.textContent = (data.perf.total_pnl || 0).toFixed(2);
+            totalPnL.className = 'metric-value ' + (data.perf.total_pnl >= 0 ? 'positive' : 'negative');
+            
+            // Risk
+            document.getElementById('open_positions').textContent = data.risk.open_positions || 0;
+            const dailyPnL = document.getElementById('daily_pnl');
+            dailyPnL.textContent = (data.risk.daily_pnl || 0).toFixed(2);
+            dailyPnL.className = 'metric-value ' + (data.risk.daily_pnl >= 0 ? 'positive' : 'negative');
+            
+            // Scan
+            document.getElementById('last_scan').textContent = (data.scan_stats.last_ms || 0).toFixed(0) + 'ms';
+            document.getElementById('buy_signals').textContent = data.scan_stats.n_buy || 0;
+            document.getElementById('sell_signals').textContent = data.scan_stats.n_sell || 0;
+            
+            // Positions
+            const positionsEl = document.getElementById('positions_list');
+            if (Object.keys(data.positions).length === 0) {
+                positionsEl.innerHTML = '<p style="color: #666;">No open positions</p>';
+            } else {
+                positionsEl.innerHTML = Object.entries(data.positions).map(([sym, pos]) => `
+                    <div class="position-item">
+                        <strong>${sym}</strong><br>
+                        Size: ${pos.positionAmt} | Mark Price: ${pos.markPrice}
+                    </div>
+                `).join('');
+            }
+            
+            // Last update
+            document.getElementById('last_update').textContent = new Date(data.last_update).toLocaleString();
+        }
+        
+        // Auto-refresh every 5 seconds
+        setInterval(refreshData, 5000);
+        refreshData();
+    </script>
+</body>
+</html>
+    """

@@ -1,144 +1,177 @@
-"""core/database.py — Async SQLite for trades, signals, performance stats."""
-from __future__ import annotations
-import json
-from datetime import datetime, timezone
-from loguru import logger
+"""Database management for trades, signals, and performance tracking."""
 import aiosqlite
+import os
+from datetime import datetime, timezone
+from typing import Optional, Dict, List, Tuple
+from loguru import logger
 
-DB_PATH = "data/ultrabot.db"
+from core.config import cfg
 
 
 async def init_db() -> None:
-    """Create tables if they don't exist."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    """Initialize database tables."""
+    os.makedirs(os.path.dirname(cfg.db_path) or ".", exist_ok=True)
+    
+    async with aiosqlite.connect(cfg.db_path) as db:
         await db.executescript("""
         CREATE TABLE IF NOT EXISTS trades (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol      TEXT    NOT NULL,
-            side        TEXT    NOT NULL,
-            entry_price REAL    NOT NULL,
-            exit_price  REAL,
-            qty         REAL,
-            size_usdt   REAL,
-            sl          REAL,
-            tp          REAL,
-            pnl         REAL,
-            pnl_pct     REAL,
-            reason      TEXT,
-            metrics     TEXT,
-            opened_at   TEXT    NOT NULL,
-            closed_at   TEXT,
-            duration_s  INTEGER
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            exit_price REAL,
+            size REAL NOT NULL,
+            sl_price REAL,
+            tp_price REAL,
+            pnl REAL,
+            pnl_pct REAL,
+            close_reason TEXT,
+            opened_at TEXT NOT NULL,
+            closed_at TEXT,
+            duration_seconds INTEGER
         );
-
+        
         CREATE TABLE IF NOT EXISTS signals (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol     TEXT    NOT NULL,
-            signal     TEXT    NOT NULL,
-            metrics    TEXT,
-            executed   INTEGER DEFAULT 0,
-            ts         TEXT    NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            signal TEXT NOT NULL,
+            confidence REAL,
+            adx REAL,
+            rsi REAL,
+            atr_pct REAL,
+            delta1 REAL,
+            delta2 REAL,
+            delta3 REAL,
+            executed BOOLEAN,
+            created_at TEXT NOT NULL
         );
-
-        CREATE INDEX IF NOT EXISTS idx_trades_symbol  ON trades(symbol);
-        CREATE INDEX IF NOT EXISTS idx_trades_opened  ON trades(opened_at);
-        CREATE INDEX IF NOT EXISTS idx_signals_ts     ON signals(ts);
+        
+        CREATE TABLE IF NOT EXISTS daily_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT UNIQUE NOT NULL,
+            win_count INTEGER DEFAULT 0,
+            loss_count INTEGER DEFAULT 0,
+            total_pnl REAL DEFAULT 0,
+            max_drawdown REAL DEFAULT 0
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
+        CREATE INDEX IF NOT EXISTS idx_trades_opened_at ON trades(opened_at);
+        CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);
+        CREATE INDEX IF NOT EXISTS idx_signals_created_at ON signals(created_at);
         """)
         await db.commit()
-    logger.info("Database initialised")
+    
+    logger.info(f"Database initialized: {cfg.db_path}")
 
 
 async def save_trade_open(
-    symbol: str, side: str, entry: float,
-    qty: float, size_usdt: float, sl: float, tp: float, metrics: dict
+    symbol: str, side: str, entry_price: float, 
+    exit_price: float, size: float, sl: float, tp: float,
+    metrics: Dict
 ) -> int:
+    """Save a new open trade."""
     opened_at = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """INSERT INTO trades
-               (symbol, side, entry_price, qty, size_usdt, sl, tp, metrics, opened_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (symbol, side, entry, qty, size_usdt, sl, tp,
-             json.dumps(metrics), opened_at)
+    
+    async with aiosqlite.connect(cfg.db_path) as db:
+        cursor = await db.execute(
+            """INSERT INTO trades 
+            (symbol, side, entry_price, size, sl_price, tp_price, opened_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (symbol, side, entry_price, size, sl, tp, opened_at)
         )
         await db.commit()
-        return cur.lastrowid  # type: ignore[return-value]
+        return cursor.lastrowid
 
 
 async def save_trade_close(
     trade_id: int, exit_price: float, pnl: float, pnl_pct: float,
-    reason: str, entry_price: float, opened_at: str
+    close_reason: str, entry_price: float, opened_at: str
 ) -> None:
+    """Update trade with close information."""
     closed_at = datetime.now(timezone.utc).isoformat()
-    duration_s = 0
-    if opened_at:
-        try:
-            dur = datetime.now(timezone.utc) - datetime.fromisoformat(opened_at)
-            duration_s = int(dur.total_seconds())
-        except Exception:
-            pass
-
-    async with aiosqlite.connect(DB_PATH) as db:
+    
+    async with aiosqlite.connect(cfg.db_path) as db:
         await db.execute(
-            """UPDATE trades SET
-               exit_price=?, pnl=?, pnl_pct=?, reason=?, closed_at=?, duration_s=?
-               WHERE id=?""",
-            (exit_price, pnl, pnl_pct, reason, closed_at, duration_s, trade_id)
+            """UPDATE trades 
+            SET exit_price = ?, pnl = ?, pnl_pct = ?, close_reason = ?, closed_at = ?
+            WHERE id = ?""",
+            (exit_price, pnl, pnl_pct, close_reason, closed_at, trade_id)
         )
         await db.commit()
 
 
-async def save_signal(symbol: str, signal: str, metrics: dict, executed: bool) -> None:
-    ts = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+async def save_signal(
+    symbol: str, signal: str, metrics: Dict, executed: bool = False
+) -> None:
+    """Save a trading signal."""
+    created_at = datetime.now(timezone.utc).isoformat()
+    
+    async with aiosqlite.connect(cfg.db_path) as db:
         await db.execute(
-            "INSERT INTO signals (symbol, signal, metrics, executed, ts) VALUES (?,?,?,?,?)",
-            (symbol, signal, json.dumps(metrics), int(executed), ts)
+            """INSERT INTO signals 
+            (symbol, signal, confidence, adx, rsi, atr_pct, delta1, delta2, delta3, executed, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                symbol, signal,
+                metrics.get("confidence", 0),
+                metrics.get("adx", 0),
+                metrics.get("rsi", 0),
+                metrics.get("atr_pct", 0),
+                metrics.get("delta1", 0),
+                metrics.get("delta2", 0),
+                metrics.get("delta3", 0),
+                executed,
+                created_at
+            )
         )
         await db.commit()
 
 
-async def get_performance_stats() -> dict:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-
-        # All closed trades
-        cur = await db.execute(
-            "SELECT pnl, pnl_pct, duration_s, symbol FROM trades WHERE closed_at IS NOT NULL"
+async def get_performance_stats() -> Dict:
+    """Get overall performance statistics."""
+    async with aiosqlite.connect(cfg.db_path) as db:
+        # Total trades
+        cursor = await db.execute("SELECT COUNT(*) FROM trades WHERE closed_at IS NOT NULL")
+        total_trades = (await cursor.fetchone())[0]
+        
+        # Wins and losses
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM trades WHERE closed_at IS NOT NULL AND pnl > 0"
         )
-        rows = await cur.fetchall()
-
-    if not rows:
+        wins = (await cursor.fetchone())[0]
+        losses = total_trades - wins
+        
+        # Total PnL
+        cursor = await db.execute("SELECT SUM(pnl) FROM trades WHERE closed_at IS NOT NULL")
+        total_pnl = (await cursor.fetchone())[0] or 0
+        
+        # Win rate
+        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+        
+        # Average trade
+        avg_trade = (total_pnl / total_trades) if total_trades > 0 else 0
+        
         return {
-            "total_trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
-            "total_pnl": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
-            "best_trade": 0.0, "worst_trade": 0.0, "avg_duration_m": 0.0,
+            "total_trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "total_pnl": total_pnl,
+            "avg_trade": avg_trade,
         }
 
-    pnls   = [r["pnl"] for r in rows if r["pnl"] is not None]
-    wins   = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
-    durs   = [r["duration_s"] for r in rows if r["duration_s"]]
 
-    return {
-        "total_trades":  len(pnls),
-        "wins":          len(wins),
-        "losses":        len(losses),
-        "win_rate":      round(len(wins) / len(pnls) * 100, 1) if pnls else 0.0,
-        "total_pnl":     round(sum(pnls), 2),
-        "avg_win":       round(sum(wins) / len(wins), 2) if wins else 0.0,
-        "avg_loss":      round(sum(losses) / len(losses), 2) if losses else 0.0,
-        "best_trade":    round(max(pnls), 2) if pnls else 0.0,
-        "worst_trade":   round(min(pnls), 2) if pnls else 0.0,
-        "avg_duration_m": round(sum(durs) / len(durs) / 60, 1) if durs else 0.0,
-    }
-
-
-async def get_recent_trades(limit: int = 20) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
+async def get_recent_trades(limit: int = 10) -> List[Dict]:
+    """Get recent closed trades."""
+    async with aiosqlite.connect(cfg.db_path) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+        cursor = await db.execute(
+            """SELECT * FROM trades 
+            WHERE closed_at IS NOT NULL 
+            ORDER BY closed_at DESC 
+            LIMIT ?""",
+            (limit,)
         )
-        rows = await cur.fetchall()
-    return [dict(r) for r in rows]
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
