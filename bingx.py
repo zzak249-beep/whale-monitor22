@@ -1,6 +1,6 @@
 """
 Cliente BingX Perpetual Futures.
-Endpoints verificados contra: https://bingx-api.github.io/docs/#/en-us/swapV2/
+Endpoints: https://bingx-api.github.io/docs/#/en-us/swapV2/
 """
 import hashlib
 import hmac
@@ -27,10 +27,7 @@ class BingXClient:
     async def _get(self, path: str, params: dict = None, signed: bool = False) -> dict:
         p = params or {}
         headers = {"X-BX-APIKEY": self.api_key}
-        if signed:
-            qs = self._sign(p)
-        else:
-            qs = urllib.parse.urlencode(p) if p else ""
+        qs = self._sign(p) if signed else (urllib.parse.urlencode(p) if p else "")
         url = f"{BASE}{path}?{qs}" if qs else f"{BASE}{path}"
         async with aiohttp.ClientSession(headers=headers) as s:
             async with s.get(url) as r:
@@ -50,14 +47,9 @@ class BingXClient:
         return data["data"]
 
     async def top_symbols_by_volume(self, n: int = 20) -> list[str]:
-        """Retorna los N pares USDT con mayor volumen en 24h."""
         data = await self._get("/openApi/swap/v2/quote/ticker")
-        # El endpoint puede devolver lista o dict con clave "tickers"
         if isinstance(data, dict):
-            logger.info(f"TICKER FORMAT (dict keys): {list(data.keys())}")
             data = data.get("tickers", data.get("data", []))
-        elif isinstance(data, list) and data:
-            logger.info(f"TICKER FORMAT (list sample): {data[0]}")
         usdt = [t for t in data if isinstance(t, dict) and t.get("symbol", "").endswith("-USDT")]
         usdt.sort(key=lambda t: float(t.get("quoteVolume", 0)), reverse=True)
         symbols = [t["symbol"] for t in usdt[:n]]
@@ -65,24 +57,17 @@ class BingXClient:
         return symbols
 
     async def klines(self, symbol: str, interval: str, limit: int = 100) -> list:
-        """
-        Velas OHLCV.
-        Retorna lista de dicts con keys: o, h, l, c, v (ya convertidos a float).
-        Formato real BingX: [{"open":..,"high":..,"low":..,"close":..,"volume":..,"time":..}]
-        """
         raw = await self._get("/openApi/swap/v3/quote/klines", {
             "symbol": symbol, "interval": interval, "limit": limit
         })
-        if raw:
-            logger.info(f"KLINES FORMAT: {raw[0]}")
         result = []
         for c in raw:
             if isinstance(c, dict):
                 result.append({
-                    "o": float(c.get("open", c.get("o", 0))),
-                    "h": float(c.get("high", c.get("h", 0))),
-                    "l": float(c.get("low",  c.get("l", 0))),
-                    "c": float(c.get("close", c.get("c", 0))),
+                    "o": float(c.get("open",   c.get("o", 0))),
+                    "h": float(c.get("high",   c.get("h", 0))),
+                    "l": float(c.get("low",    c.get("l", 0))),
+                    "c": float(c.get("close",  c.get("c", 0))),
                     "v": float(c.get("volume", c.get("v", 0))),
                 })
             elif isinstance(c, list) and len(c) >= 5:
@@ -91,20 +76,14 @@ class BingXClient:
                     "l": float(c[3]), "c": float(c[4]),
                     "v": float(c[5]) if len(c) > 5 else 0.0,
                 })
-            else:
-                logger.warning(f"KLINES unexpected: {type(c)} = {c}")
         return result
 
     async def balance_usdt(self) -> float:
         data = await self._get("/openApi/swap/v2/user/balance", signed=True)
-        logger.info(f"BALANCE RAW: {data}")
-        # BingX puede devolver dict con balance directo o lista
         if isinstance(data, dict):
-            # Formato: {"balance": {"asset":"USDT", "availableMargin":"..."}}
             b = data.get("balance", {})
             if isinstance(b, dict):
                 return float(b.get("availableMargin", b.get("available", 0)))
-            # Formato: {"balance": [{"asset":"USDT", ...}]}
             if isinstance(b, list):
                 for asset in b:
                     if isinstance(asset, dict) and asset.get("asset") == "USDT":
@@ -112,35 +91,23 @@ class BingXClient:
         return 0.0
 
     async def open_order(self, symbol: str, side: str, qty: float, tp_price: float, sl_price: float) -> str:
-        """
-        Abre posición MARKET con TP y SL adjuntos.
-        side: "LONG" o "SHORT"
-        Retorna orderId.
-        """
         action = "BUY" if side == "LONG" else "SELL"
         close  = "SELL" if side == "LONG" else "BUY"
-
-        # Orden principal
         order = await self._post("/openApi/swap/v2/trade/order", {
             "symbol": symbol, "side": action, "positionSide": side,
             "type": "MARKET", "quantity": qty,
         })
         order_id = order["order"]["orderId"]
-
-        # TP
         await self._post("/openApi/swap/v2/trade/order", {
             "symbol": symbol, "side": close, "positionSide": side,
             "type": "TAKE_PROFIT_MARKET", "quantity": qty,
             "stopPrice": round(tp_price, 8), "workingType": "MARK_PRICE",
         })
-
-        # SL
         await self._post("/openApi/swap/v2/trade/order", {
             "symbol": symbol, "side": close, "positionSide": side,
             "type": "STOP_MARKET", "quantity": qty,
             "stopPrice": round(sl_price, 8), "workingType": "MARK_PRICE",
         })
-
         return order_id
 
     async def close_position(self, symbol: str, side: str, qty: float):

@@ -12,31 +12,31 @@ from strategy import signal, tp_sl
 import telegram
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("bot")
 
 # --- Config desde entorno ---
-API_KEY        = os.environ["BINGX_API_KEY"]
-API_SECRET     = os.environ["BINGX_API_SECRET"]
-TG_TOKEN       = os.environ["TELEGRAM_BOT_TOKEN"]
-TG_CHAT        = os.environ["TELEGRAM_CHAT_ID"]
-TRADE_USDT     = float(os.environ.get("TRADE_AMOUNT_USDT", "10"))
-MAX_TRADES     = int(os.environ.get("MAX_OPEN_TRADES", "3"))
-SCAN_SECONDS   = int(os.environ.get("SCAN_INTERVAL_SECONDS", "60"))
-TOP_N          = int(os.environ.get("TOP_N_SYMBOLS", "20"))
+API_KEY      = os.environ["BINGX_API_KEY"]
+API_SECRET   = os.environ["BINGX_API_SECRET"]
+TG_TOKEN     = os.environ["TELEGRAM_BOT_TOKEN"]
+TG_CHAT      = os.environ["TELEGRAM_CHAT_ID"]
+TRADE_USDT   = float(os.environ.get("TRADE_AMOUNT_USDT", "10"))
+MAX_TRADES   = int(os.environ.get("MAX_OPEN_TRADES", "3"))
+SCAN_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "60"))
+TOP_N        = int(os.environ.get("TOP_N_SYMBOLS", "20"))
 
-# Estado global (suficiente para este bot)
-open_trades: dict = {}   # symbol -> {side, entry, tp, sl, qty}
+open_trades: dict = {}
 
 
 async def notify(text: str):
-    await telegram.send(TG_TOKEN, TG_CHAT, text)
+    ok = await telegram.send(TG_TOKEN, TG_CHAT, text)
+    if not ok:
+        logger.error("Telegram send FAILED — revisa TG_TOKEN y TG_CHAT_ID")
 
 
 async def monitor(client: BingXClient):
-    """Cierra trades que alcanzaron TP o SL manualmente si la orden no se ejecutó sola."""
     for symbol, trade in list(open_trades.items()):
         try:
             ticker_data = await client._get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
@@ -62,7 +62,6 @@ async def monitor(client: BingXClient):
 
 
 async def scan(client: BingXClient, symbols: list[str]):
-    """Escanea señales en todos los símbolos."""
     for symbol in symbols:
         if symbol in open_trades:
             continue
@@ -71,7 +70,7 @@ async def scan(client: BingXClient, symbols: list[str]):
         try:
             c15 = await client.klines(symbol, "15m", limit=60)
             c4h = await client.klines(symbol, "4h",  limit=30)
-            sig = signal(c15, c4h)
+            sig = signal(c15, c4h, symbol=symbol)
             if sig is None:
                 continue
 
@@ -106,7 +105,7 @@ async def main():
         f"🤖 *Maki Bot iniciado*\n"
         f"Balance: `{balance:.2f} USDT`\n"
         f"Monto/trade: `{TRADE_USDT} USDT`\n"
-        f"Pares activos: `{len(symbols)}`\n"
+        f"Pares: `{len(symbols)}`\n"
         f"TP: +0.45% | SL: -0.30%\n"
         f"Max trades: `{MAX_TRADES}`"
     )
@@ -115,12 +114,8 @@ async def main():
         try:
             await monitor(client)
             await scan(client, symbols)
-
-            # Refrescar top pares cada hora (cada 60 ciclos de 60s)
             if datetime.now(timezone.utc).minute == 0:
                 symbols = await client.top_symbols_by_volume(TOP_N)
-                logger.info(f"Pares actualizados: {symbols}")
-
         except Exception as e:
             logger.error(f"Error en loop: {e}")
             await notify(f"⚠️ Error en bot: `{str(e)[:200]}`")
