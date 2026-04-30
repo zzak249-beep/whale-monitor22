@@ -13,8 +13,8 @@ from datetime import datetime
 from loguru import logger
 from aiohttp import web
 
-from config import cfg
-from exchange import client as ex
+from core.config import cfg
+import client as ex
 from scanner import fetch_universe
 from strategy import get_signal
 from pos_manager import (
@@ -48,7 +48,7 @@ async def start_health_server() -> None:
 # ── Entry execution ───────────────────────────────────────────────────────────
 async def enter_trade(sig, ohlcv: dict) -> None:
     """Set leverage, place order, record trade."""
-    from config import cfg
+    from core.config import cfg
 
     # Guard: already in this symbol
     if sig.symbol in open_symbols():

@@ -17,7 +17,7 @@ import asyncio
 from dataclasses import dataclass, field
 from loguru import logger
 
-from exchange import client as ex
+import client as ex
 from notifier import notify
 from strategy import delta1_flipped
 
@@ -80,7 +80,7 @@ async def sync_from_exchange() -> None:
 
 async def _close_partial(trade: Trade, live_pos: dict) -> None:
     """Close cfg.partial_pct of position."""
-    from config import cfg
+    from core.config import cfg
     qty = trade.qty * cfg.partial_pct
     if qty <= 0:
         return
@@ -114,7 +114,7 @@ async def _move_to_breakeven(trade: Trade) -> None:
 
 async def manage_positions(ohlcv_map: dict[str, dict]) -> None:
     """Called once per scan cycle for every open trade."""
-    from config import cfg
+    from core.config import cfg
 
     closed_symbols: list[str] = []
 
