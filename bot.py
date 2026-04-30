@@ -1,6 +1,6 @@
 """
 Maki Bot — ZigZag + 20MA 4H para BingX Futures
-TP: +0.45% | SL: -0.30% | Top 20 pares por volumen
+TP: +0.45% | SL: -0.30% | Todos los pares USDT en lotes de 50
 """
 import asyncio
 import logging
@@ -17,15 +17,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bot")
 
-# --- Config desde entorno ---
 API_KEY      = os.environ["BINGX_API_KEY"]
 API_SECRET   = os.environ["BINGX_API_SECRET"]
 TG_TOKEN     = os.environ["TELEGRAM_BOT_TOKEN"]
 TG_CHAT      = os.environ["TELEGRAM_CHAT_ID"]
 TRADE_USDT   = float(os.environ.get("TRADE_AMOUNT_USDT", "10"))
 MAX_TRADES   = int(os.environ.get("MAX_OPEN_TRADES", "3"))
-SCAN_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "60"))
-TOP_N        = int(os.environ.get("TOP_N_SYMBOLS", "20"))
+BATCH_PAUSE  = float(os.environ.get("BATCH_PAUSE_SECONDS", "2"))  # pausa entre lotes
 
 open_trades: dict = {}
 
@@ -61,66 +59,95 @@ async def monitor(client: BingXClient):
             logger.warning(f"Error monitorizando {symbol}: {e}")
 
 
-async def scan(client: BingXClient, symbols: list[str]):
-    for symbol in symbols:
-        if symbol in open_trades:
-            continue
-        if len(open_trades) >= MAX_TRADES:
-            break
-        try:
-            c15 = await client.klines(symbol, "15m", limit=60)
-            c4h = await client.klines(symbol, "4h",  limit=30)
-            sig = signal(c15, c4h, symbol=symbol)
-            if sig is None:
+async def scan_batch(client: BingXClient, symbols: list[str]):
+    """Escanea una lista de símbolos en lotes de 50 con pausa entre lotes."""
+    BATCH = 50
+    for i in range(0, len(symbols), BATCH):
+        batch = symbols[i:i + BATCH]
+        logger.info(f"Escaneando lote {i//BATCH + 1}: {batch[0]} … {batch[-1]}")
+
+        for symbol in batch:
+            if symbol in open_trades:
                 continue
+            if len(open_trades) >= MAX_TRADES:
+                logger.info("Max trades alcanzado, pausando escaneo.")
+                return
+            try:
+                c15 = await client.klines(symbol, "15m", limit=60)
+                c4h = await client.klines(symbol, "4h",  limit=30)
+                sig = signal(c15, c4h, symbol=symbol)
+                if sig is None:
+                    continue
 
-            price = c15[-1]["c"]
-            tp, sl = tp_sl(price, sig)
-            qty = round(TRADE_USDT / price, 6)
+                price = c15[-1]["c"]
+                tp, sl = tp_sl(price, sig)
+                qty = round(TRADE_USDT / price, 6)
 
-            order_id = await client.open_order(symbol, sig, qty, tp, sl)
-            open_trades[symbol] = {"side": sig, "entry": price, "tp": tp, "sl": sl, "qty": qty}
+                await client.open_order(symbol, sig, qty, tp, sl)
+                open_trades[symbol] = {"side": sig, "entry": price, "tp": tp, "sl": sl, "qty": qty}
 
-            emoji = "📈" if sig == "LONG" else "📉"
-            logger.info(f"Trade abierto: {symbol} {sig} @ {price:.4f} TP={tp:.4f} SL={sl:.4f}")
-            await notify(
-                f"{emoji} *{sig} — {symbol}*\n"
-                f"Entrada: `{price:.4f}`\n"
-                f"TP: `{tp:.4f}` (+0.45%)\n"
-                f"SL: `{sl:.4f}` (-0.30%)\n"
-                f"Cantidad: `{qty}` | Monto: `{TRADE_USDT} USDT`"
-            )
-        except Exception as e:
-            logger.warning(f"Error escaneando {symbol}: {e}")
+                emoji = "📈" if sig == "LONG" else "📉"
+                logger.info(f"Trade abierto: {symbol} {sig} @ {price:.4f}")
+                await notify(
+                    f"{emoji} *{sig} — {symbol}*\n"
+                    f"Entrada: `{price:.4f}`\n"
+                    f"TP: `{tp:.4f}` (+0.45%)\n"
+                    f"SL: `{sl:.4f}` (-0.30%)\n"
+                    f"Cantidad: `{qty}` | Monto: `{TRADE_USDT} USDT`"
+                )
+            except RuntimeError as e:
+                err = str(e)
+                logger.warning(f"Error orden {symbol}: {err}")
+                if any(k in err.lower() for k in ["insufficient", "balance", "margin", "1101", "2001"]):
+                    await notify(
+                        f"⚠️ *Señal detectada pero sin fondos*\n"
+                        f"Par: `{symbol}` | `{sig}`\n"
+                        f"Recarga tu wallet de Futuros en BingX."
+                    )
+                else:
+                    await notify(f"⚠️ *Error al abrir orden*\n`{symbol}`\n`{err[:200]}`")
+            except Exception as e:
+                logger.warning(f"Error escaneando {symbol}: {e}")
+
+        # Pausa entre lotes para respetar rate limit
+        await asyncio.sleep(BATCH_PAUSE)
 
 
 async def main():
     client = BingXClient(API_KEY, API_SECRET)
 
     balance = await client.balance_usdt()
-    symbols = await client.top_symbols_by_volume(TOP_N)
+    symbols = await client.all_symbols()
 
-    logger.info(f"Balance: {balance:.2f} USDT | Pares: {len(symbols)}")
+    logger.info(f"Balance: {balance:.2f} USDT | Pares totales: {len(symbols)}")
     await notify(
         f"🤖 *Maki Bot iniciado*\n"
         f"Balance: `{balance:.2f} USDT`\n"
         f"Monto/trade: `{TRADE_USDT} USDT`\n"
-        f"Pares: `{len(symbols)}`\n"
+        f"Pares: `{len(symbols)}` (todos)\n"
         f"TP: +0.45% | SL: -0.30%\n"
         f"Max trades: `{MAX_TRADES}`"
     )
 
+    last_symbol_refresh = datetime.now(timezone.utc).hour
+
     while True:
         try:
             await monitor(client)
-            await scan(client, symbols)
-            if datetime.now(timezone.utc).minute == 0:
-                symbols = await client.top_symbols_by_volume(TOP_N)
+            await scan_batch(client, symbols)
+
+            # Refrescar lista de pares cada hora
+            now_hour = datetime.now(timezone.utc).hour
+            if now_hour != last_symbol_refresh:
+                symbols = await client.all_symbols()
+                last_symbol_refresh = now_hour
+                logger.info(f"Pares actualizados: {len(symbols)}")
+
         except Exception as e:
             logger.error(f"Error en loop: {e}")
             await notify(f"⚠️ Error en bot: `{str(e)[:200]}`")
 
-        await asyncio.sleep(SCAN_SECONDS)
+        await asyncio.sleep(10)  # ciclo corto; el throttle real lo hace BATCH_PAUSE
 
 
 if __name__ == "__main__":

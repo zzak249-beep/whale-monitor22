@@ -46,6 +46,15 @@ class BingXClient:
             raise RuntimeError(f"BingX POST {path} error: {data}")
         return data["data"]
 
+    async def all_symbols(self) -> list[str]:
+        """Retorna todos los pares USDT perpetuos activos en BingX."""
+        data = await self._get("/openApi/swap/v2/quote/contracts")
+        symbols = [c["symbol"] for c in data if isinstance(c, dict)
+                   and c.get("symbol", "").endswith("-USDT")
+                   and c.get("status", 0) == 1]
+        logger.info(f"Total pares USDT activos: {len(symbols)}")
+        return symbols
+
     async def top_symbols_by_volume(self, n: int = 20) -> list[str]:
         data = await self._get("/openApi/swap/v2/quote/ticker")
         if isinstance(data, dict):
