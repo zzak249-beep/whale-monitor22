@@ -1,79 +1,88 @@
-"""
-THREE STEP FUTURE-TREND BOT — config.py
-========================================
-Toda la configuración via variables de entorno.
-Sin defaults peligrosos — BINGX_TESTNET=true por defecto.
-"""
-from __future__ import annotations
+# -*- coding: utf-8 -*-
+"""config.py -- Three Step Bot v3."""
 import os
-from dataclasses import dataclass, field
-from typing import List
-
-
-def _e(k, d=""): return os.environ.get(k, d)
-def _ef(k, d): 
-    try: return float(os.environ.get(k, d))
-    except: return float(d)
-def _ei(k, d):
-    try: return int(os.environ.get(k, d))
-    except: return int(d)
-def _eb(k, d):
-    return os.environ.get(k, str(d)).lower() in ("1","true","yes")
+from dataclasses import dataclass
 
 
 @dataclass
 class Config:
-    # ── BingX ────────────────────────────────────────────────────────────────
-    api_key:    str  = field(default_factory=lambda: _e("BINGX_API_KEY"))
-    secret_key: str  = field(default_factory=lambda: _e("BINGX_SECRET_KEY"))
-    testnet:    bool = field(default_factory=lambda: _eb("BINGX_TESTNET", True))
+    # ── BingX credentials ─────────────────────────────────────────────────
+    bingx_api_key:    str   = ""
+    bingx_secret_key: str   = ""
+
+    # ── Telegram ───────────────────────────────────────────────────────────
+    telegram_token:   str   = ""
+    telegram_chat_id: str   = ""
+
+    # ── Trade sizing ───────────────────────────────────────────────────────
+    trade_usdt:       float = 5.0   # USDT per trade (hard min 5)
+    leverage:         int   = 10    # x10 leverage
+
+    # ── Three-Step strategy ────────────────────────────────────────────────
+    period:           int   = 20    # delta window (20 = more signals)
+    atr_period:       int   = 14
+    atr_mult:         float = 1.5   # SL = ATR * 1.5 (tighter SL)
+    rr:               float = 3.0   # TP = SL * 3 (1:3 RR)
+    timeframe:        str   = "15m" # 15m = more opportunities than 1h
+
+    # ── Signal filters ─────────────────────────────────────────────────────
+    min_volume_mult:  float = 0.8   # bar vol >= 80% of 20-bar avg
+    min_atr_pct:      float = 0.3   # ATR/price >= 0.3% (avoid flat)
+    trend_filter:     bool  = True  # EMA50 trend alignment required
+    d2_min_ratio:     float = 0.1   # delta2 must be >= 10% of delta1
+
+    # ── Position management ────────────────────────────────────────────────
+    max_positions:    int   = 5
+    breakeven_r:      float = 1.0   # move SL to BE at +1R
+    partial_pct:      float = 0.5   # close 50% at BE
+    max_daily_trades: int   = 20    # circuit breaker
+
+    # ── Risk controls ──────────────────────────────────────────────────────
+    max_daily_loss_pct: float = 5.0   # halt if daily loss > 5% of balance
+    min_balance_usdt:   float = 15.0  # never trade below this balance
+
+    # ── Scanning ───────────────────────────────────────────────────────────
+    symbols_raw:    str = (
+        "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT,"
+        "DOGE-USDT,ADA-USDT,AVAX-USDT,MATIC-USDT,LINK-USDT,"
+        "DOT-USDT,LTC-USDT,ATOM-USDT,FIL-USDT,OP-USDT"
+    )
+    scan_interval:  int   = 60    # seconds (1 min on 15m TF)
+    max_concurrent: int   = 15
+
+    # ── HTTP / infra ───────────────────────────────────────────────────────
+    http_timeout:   int   = 12
+    health_port:    int   = 8080
 
     @property
-    def base_url(self) -> str:
-        return ("https://open-api-vst.bingx.com" if self.testnet
-                else "https://open-api.bingx.com")
+    def symbols(self) -> list[str]:
+        return [s.strip() for s in self.symbols_raw.split(",") if s.strip()]
 
-    # ── Telegram ─────────────────────────────────────────────────────────────
-    tg_token:   str  = field(default_factory=lambda: _e("TELEGRAM_BOT_TOKEN"))
-    tg_chat_id: str  = field(default_factory=lambda: _e("TELEGRAM_CHAT_ID"))
+    def __post_init__(self) -> None:
+        self.bingx_api_key      = os.getenv("BINGX_API_KEY",       self.bingx_api_key)
+        self.bingx_secret_key   = os.getenv("BINGX_SECRET_KEY",    self.bingx_secret_key)
+        self.telegram_token     = os.getenv("TELEGRAM_TOKEN",       self.telegram_token)
+        self.telegram_chat_id   = os.getenv("TELEGRAM_CHAT_ID",     self.telegram_chat_id)
+        self.trade_usdt         = max(5.0, float(os.getenv("TRADE_USDT",    str(self.trade_usdt))))
+        self.leverage           = int(os.getenv("LEVERAGE",         str(self.leverage)))
+        self.period             = int(os.getenv("PERIOD",           str(self.period)))
+        self.atr_period         = int(os.getenv("ATR_PERIOD",       str(self.atr_period)))
+        self.atr_mult           = float(os.getenv("ATR_MULT",       str(self.atr_mult)))
+        self.rr                 = float(os.getenv("RR",             str(self.rr)))
+        self.timeframe          = os.getenv("TIMEFRAME",            self.timeframe)
+        self.max_positions      = int(os.getenv("MAX_POSITIONS",    str(self.max_positions)))
+        self.scan_interval      = int(os.getenv("SCAN_INTERVAL",    str(self.scan_interval)))
+        self.symbols_raw        = os.getenv("SYMBOLS",              self.symbols_raw)
+        self.health_port        = int(os.getenv("PORT",             str(self.health_port)))
+        self.max_daily_loss_pct = float(os.getenv("MAX_DAILY_LOSS", str(self.max_daily_loss_pct)))
+        self.min_volume_mult    = float(os.getenv("MIN_VOL_MULT",   str(self.min_volume_mult)))
+        self.trend_filter       = os.getenv("TREND_FILTER", "true").lower() == "true"
+        self.max_daily_trades   = int(os.getenv("MAX_DAILY_TRADES", str(self.max_daily_trades)))
 
-    # ── Trading ──────────────────────────────────────────────────────────────
-    symbols: List[str] = field(default_factory=lambda: [
-        s.strip() for s in _e(
-            "SYMBOLS",
-            "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,"
-            "XRP-USDT,DOGE-USDT,ADA-USDT,AVAX-USDT"
-        ).split(",") if s.strip()
-    ])
-    timeframe:     str   = field(default_factory=lambda: _e("TIMEFRAME", "1h"))
-    trade_usdt:    float = field(default_factory=lambda: _ef("TRADE_USDT", 5.0))
-    leverage:      int   = field(default_factory=lambda: _ei("LEVERAGE", 10))
-    max_positions: int   = field(default_factory=lambda: _ei("MAX_POSITIONS", 3))
-
-    # ── Strategy: Three Step Volume Delta ────────────────────────────────────
-    period:     int   = field(default_factory=lambda: _ei("PERIOD", 25))
-    atr_period: int   = field(default_factory=lambda: _ei("ATR_PERIOD", 14))
-    atr_mult:   float = field(default_factory=lambda: _ef("ATR_MULT", 2.0))
-    rr:         float = field(default_factory=lambda: _ef("RR", 2.0))
-
-    # ── Stop Loss / Take Profit automático ───────────────────────────────────
-    # SL = entry ± atr_mult × ATR
-    # TP1 = entry ± rr × rr_atr × ATR  (parcial 50%)
-    # TP2 = entry ± rr2 × rr_atr × ATR (resto)
-    rr_atr:       float = field(default_factory=lambda: _ef("RR_ATR", 1.0))
-    tp2_mult:     float = field(default_factory=lambda: _ef("TP2_MULT", 3.5))
-    partial_pct:  float = field(default_factory=lambda: _ef("PARTIAL_PCT", 50.0))
-
-    # Breakeven: mover SL a entry cuando precio avanza X% del recorrido SL→TP1
-    be_trigger:   float = field(default_factory=lambda: _ef("BE_TRIGGER", 0.5))
-
-    # ── Runtime ──────────────────────────────────────────────────────────────
-    scan_interval:  int = field(default_factory=lambda: _ei("SCAN_INTERVAL", 300))
-    max_concurrent: int = field(default_factory=lambda: _ei("MAX_CONCURRENT", 8))
-    health_port:    int = field(default_factory=lambda: _ei("PORT", 8080))
-
-    # ── Risk ─────────────────────────────────────────────────────────────────
-    max_daily_loss_usdt: float = field(default_factory=lambda: _ef("MAX_DAILY_LOSS", 50.0))
+        if not self.bingx_api_key or not self.bingx_secret_key:
+            import sys
+            print("FATAL: BINGX_API_KEY / BINGX_SECRET_KEY not set", flush=True)
+            sys.exit(1)
 
 
 cfg = Config()

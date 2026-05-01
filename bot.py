@@ -1,19 +1,18 @@
-"""
-THREE STEP FUTURE-TREND BOT v2.0
-==================================
-Mejoras vs v1.0:
-  • SL y TP automáticos en exchange (no solo en bot)
-  • Breakeven automático al 50% del recorrido
-  • TP parcial 50% en TP1, trail en TP2
-  • Notificación de TODAS las entradas y salidas con PnL real
-  • 10× leverage configurable (LEVERAGE=10)
-  • Resumen de stats cada hora
-  • Health server para Railway
+# -*- coding: utf-8 -*-
+"""bot.py -- Three Step Bot v3.
+
+Key improvements over v2:
+  - Score-based signal prioritization (higher score enters first)
+  - Circuit breaker: halts on daily loss or max trades
+  - Bot-only position mode: ignores external positions
+  - Rich /health endpoint with stats
+  - Graceful SIGTERM shutdown
+  - Min balance guard before every entry
 """
 from __future__ import annotations
 import asyncio
+import signal
 import sys
-import time
 
 from loguru import logger
 from aiohttp import web
@@ -23,149 +22,124 @@ import client as ex
 from scanner import fetch_universe
 from strategy import get_signal
 from pos_manager import (
-    Trade, add_trade, open_symbols, trade_count,
+    Trade, add_trade, open_symbols, trade_count, is_halted,
     manage_positions, sync_from_exchange, get_stats,
 )
-from notifier import (
-    start_notifier, notify, notify_entry, notify_stats,
-)
+from notifier import notify
 
+# ── Logging ───────────────────────────────────────────────────────────────────
 logger.remove()
 logger.add(
     sys.stdout, level="INFO",
     format="<green>{time:HH:mm:ss}</green> | <level>{level: <7}</level> | {message}"
 )
 
-_last_stats_ts: float = 0.0
 
-
-# ── Health server ─────────────────────────────────────────────────────────────
-
+# ── Health endpoint ───────────────────────────────────────────────────────────
 async def _health(_: web.Request) -> web.Response:
     stats = get_stats()
     return web.json_response({
-        "status":   "ok",
-        "trades":   trade_count(),
-        "wins":     stats["wins"],
-        "losses":   stats["losses"],
-        "total_pnl": stats["total_pnl"],
+        "status":        "halted" if stats["halted"] else "ok",
+        "open_trades":   stats["open"],
+        "daily_trades":  stats["daily_trades"],
+        "daily_pnl":     stats["daily_pnl"],
+        "symbols":       list(open_symbols()),
+        "version":       "3.0",
     })
 
 
-async def start_health_server():
+async def start_health_server() -> None:
     app = web.Application()
-    app.router.add_get("/",       _health)
+    app.router.add_get("/", _health)
     app.router.add_get("/health", _health)
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", cfg.health_port).start()
-    logger.info(f"Health server :{cfg.health_port}")
+    site = web.TCPSite(runner, "0.0.0.0", cfg.health_port)
+    await site.start()
+    logger.info(f"Health server on :{cfg.health_port}")
 
 
-# ── Entry execution ───────────────────────────────────────────────────────────
-
-async def enter_trade(sig, ohlcv: dict) -> None:
-    # Guard: ya en este símbolo
+# ── Entry ─────────────────────────────────────────────────────────────────────
+async def enter_trade(sig) -> None:
     if sig.symbol in open_symbols():
         return
-
-    # Guard: max posiciones
     if trade_count() >= cfg.max_positions:
-        logger.debug(f"[SKIP] max_positions={cfg.max_positions}")
+        logger.debug(f"[SKIP] {sig.symbol} — max positions ({cfg.max_positions})")
+        return
+    if is_halted():
+        logger.warning(f"[SKIP] {sig.symbol} — bot halted (circuit breaker)")
         return
 
-    # Verificar balance
+    size = max(cfg.trade_usdt, 5.0)
+    required_margin = (size / cfg.leverage) * 1.3
+
     bal = await ex.get_balance()
-    if bal < cfg.trade_usdt * 1.1:
-        logger.warning(f"[SKIP] balance bajo: {bal:.2f} USDT")
-        notify(
-            f"⚠️ <b>Balance bajo: {bal:.2f} USDT</b>\n"
-            f"Señal ignorada: <code>{sig.symbol}</code>\n"
-            f"Recarga tu wallet de Futuros en BingX."
-        )
+    if bal < cfg.min_balance_usdt:
+        logger.warning(f"[SKIP] {sig.symbol} — balance {bal:.2f} < min {cfg.min_balance_usdt}")
+        return
+    if bal < required_margin:
+        logger.warning(f"[SKIP] {sig.symbol} — need {required_margin:.2f} USDT, have {bal:.2f}")
         return
 
-    # Configurar leverage
     await ex.set_leverage(sig.symbol, cfg.leverage)
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.3)
 
-    # Calcular TP2
-    atr = sig.atr
-    tp2 = (sig.price + cfg.tp2_mult * atr) if sig.side == "BUY" else (sig.price - cfg.tp2_mult * atr)
-
-    # Colocar orden con SL y TP1 automáticos en exchange
     resp = await ex.place_market_order(
         symbol=sig.symbol, side=sig.side,
-        size_usdt=cfg.trade_usdt,
-        sl=sig.sl, tp=sig.tp,
-        leverage=cfg.leverage,
+        size_usdt=size, sl=sig.sl, tp=sig.tp,
     )
-
     code = resp.get("code", -1)
     if code not in (0, 200, None):
         logger.warning(f"[ORDER FAIL] {sig.symbol} code={code} {resp.get('msg','')}")
         return
 
-    # Obtener qty ejecutada
     order_data = resp.get("data", {})
     if isinstance(order_data, dict):
         order_data = order_data.get("order", order_data)
     qty = float(order_data.get("executedQty", 0) or order_data.get("origQty", 0))
     if qty <= 0:
-        # Fallback
-        mark_data = await ex._get("/openApi/swap/v2/quote/price", {"symbol": sig.symbol})
-        price = float(mark_data.get("data", {}).get("price", sig.price))
-        qty = (cfg.trade_usdt * cfg.leverage) / price
+        qty = (size * cfg.leverage) / sig.price
 
     trade = Trade(
         symbol=sig.symbol, side=sig.side,
-        entry=sig.price, sl=sig.sl,
-        tp=sig.tp, tp2=tp2,
-        atr=sig.atr,
-        size_usdt=cfg.trade_usdt, qty=round(qty, 6),
-        order_id=str(order_data.get("orderId", "")),
+        entry=sig.price, sl=sig.sl, tp=sig.tp,
+        atr=sig.atr, size_usdt=size, qty=qty,
+        score=sig.score, order_id=str(order_data.get("orderId", "")),
+        bot_opened=True,
     )
     add_trade(trade)
 
+    stars = "⭐" * sig.score
     logger.success(
-        f"[ENTRY] {sig.symbol} {sig.side} @ {sig.price:.6g} "
-        f"SL={sig.sl:.6g} TP1={sig.tp:.6g} TP2={tp2:.6g} "
-        f"qty={qty:.4f} {cfg.leverage}x"
+        f"[ENTRY] {sig.symbol} {sig.side} @ {sig.price:.6f} "
+        f"SL={sig.sl:.6f} TP={sig.tp:.6f} score={sig.score}/5"
     )
-
-    # ── Notificación completa de entrada ──────────────────────────────────────
-    notify_entry(
-        symbol=sig.symbol,
-        side=sig.side,
-        price=sig.price,
-        sl=sig.sl,
-        tp1=sig.tp,
-        tp2=tp2,
-        size_usdt=cfg.trade_usdt,
-        leverage=cfg.leverage,
-        qty=round(qty, 4),
-        delta1=sig.delta1,
-        delta2=sig.delta2,
-        delta3=sig.delta3,
-        vol_ratio=sig.vol_ratio,
+    await notify(
+        f"🚀 *[ENTRY]* {sig.symbol} `{sig.side}` {stars}\n"
+        f"Price: `{sig.price:.6f}`\n"
+        f"SL: `{sig.sl:.6f}` | TP: `{sig.tp:.6f}`\n"
+        f"Size: `{size} USDT ×{cfg.leverage}` | Vol: `{sig.vol_ratio:.1f}x`\n"
+        f"Δ1: `{sig.delta1:+.0f}` Δ2: `{sig.delta2:+.0f}` Score: `{sig.score}/5`"
     )
 
 
-# ── Scan loop ─────────────────────────────────────────────────────────────────
-
+# ── Scan cycle ────────────────────────────────────────────────────────────────
 async def scan_cycle() -> None:
-    symbols   = cfg.symbols
+    if is_halted():
+        logger.warning("[HALTED] Skipping scan cycle — circuit breaker active")
+        return
+
+    symbols = cfg.symbols
     logger.info(
-        f"Scanning {len(symbols)} symbols | {cfg.timeframe} | "
-        f"period={cfg.period} atr_mult={cfg.atr_mult} rr={cfg.rr} lev={cfg.leverage}x"
+        f"Scanning {len(symbols)} symbols | TF={cfg.timeframe} "
+        f"open={trade_count()}/{cfg.max_positions}"
     )
 
     ohlcv_map = await fetch_universe(symbols, cfg.timeframe, cfg.max_concurrent)
-
-    # Gestionar posiciones abiertas primero
     await manage_positions(ohlcv_map)
 
-    # Buscar nuevas señales
+    # Collect all signals, sort by score (best first)
+    signals = []
     for sym, ohlcv in ohlcv_map.items():
         if sym in open_symbols():
             continue
@@ -175,78 +149,82 @@ async def scan_cycle() -> None:
             atr_period=cfg.atr_period,
             atr_mult=cfg.atr_mult,
             rr=cfg.rr,
+            min_volume_mult=cfg.min_volume_mult,
+            min_atr_pct=cfg.min_atr_pct,
+            trend_filter=cfg.trend_filter,
         )
         if sig:
-            logger.info(
-                f"[SIGNAL] {sym} {sig.side} | "
-                f"D1={sig.delta1:+.0f} D2={sig.delta2:+.0f} D3={sig.delta3:+.0f} | "
-                f"vol={sig.vol_ratio:.1f}×"
-            )
-            await enter_trade(sig, ohlcv)
+            signals.append(sig)
 
+    # Sort by score descending — best signals enter first
+    signals.sort(key=lambda s: s.score, reverse=True)
 
-# ── Stats periódicas ──────────────────────────────────────────────────────────
-
-async def maybe_send_stats():
-    global _last_stats_ts
-    now = time.time()
-    if now - _last_stats_ts >= 3600:   # cada hora
-        _last_stats_ts = now
-        notify_stats(get_stats())
+    for sig in signals:
+        if trade_count() >= cfg.max_positions:
+            break
+        logger.info(
+            f"[SIGNAL] {sig.symbol} {sig.side} score={sig.score}/5 "
+            f"vol={sig.vol_ratio:.1f}x | Δ1={sig.delta1:+.0f} Δ2={sig.delta2:+.0f}"
+        )
+        await enter_trade(sig)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-
-async def main_loop():
+async def main_loop() -> None:
     await start_health_server()
-    await start_notifier()
 
-    mode = "🟡 TESTNET" if cfg.testnet else "🔴 LIVE"
+    logger.info("=" * 62)
+    logger.info("  THREE STEP BOT  v3.0  — Professional Edition")
+    logger.info(f"  TF={cfg.timeframe} | Period={cfg.period} | ATR×{cfg.atr_mult} | RR={cfg.rr}")
+    logger.info(f"  Trade={max(cfg.trade_usdt,5)}USDT ×{cfg.leverage} | MaxPos={cfg.max_positions}")
+    logger.info(f"  Filters: vol≥{cfg.min_volume_mult}x | trend={cfg.trend_filter} | atr≥{cfg.min_atr_pct}%")
+    logger.info(f"  Risk: maxLoss={cfg.max_daily_loss_pct}% | maxTrades={cfg.max_daily_trades}/day")
+    logger.info(f"  Symbols ({len(cfg.symbols)}): {', '.join(cfg.symbols)}")
+    logger.info("=" * 62)
 
-    logger.info("=" * 60)
-    logger.info("  THREE STEP FUTURE-TREND BOT  v2.0")
-    logger.info(f"  {mode}")
-    logger.info(f"  Symbols  : {cfg.symbols}")
-    logger.info(f"  TF       : {cfg.timeframe}")
-    logger.info(f"  Trade    : {cfg.trade_usdt} USDT × {cfg.leverage}x")
-    logger.info(f"  Period   : {cfg.period} | ATR×{cfg.atr_mult} | RR={cfg.rr}")
-    logger.info(f"  SL auto  : entry ± {cfg.atr_mult}×ATR")
-    logger.info(f"  TP1 auto : entry ± {cfg.rr}×ATR (50%)")
-    logger.info(f"  TP2 auto : entry ± {cfg.tp2_mult}×ATR (50%)")
-    logger.info(f"  Breakeven: al {cfg.be_trigger:.0%} del recorrido")
-    logger.info("=" * 60)
+    bal = await ex.get_balance()
+    logger.info(f"  Balance: {bal:.2f} USDT")
 
-    notify(
-        f"🚀 <b>Three Step Bot v2.0 — ONLINE</b>\n"
-        f"{mode}\n"
-        f"{'─'*30}\n"
-        f"📊 Símbolos: <code>{', '.join(cfg.symbols)}</code>\n"
-        f"⏱ TF: <code>{cfg.timeframe}</code> | Scan: cada <code>{cfg.scan_interval}s</code>\n"
-        f"💰 Trade: <code>{cfg.trade_usdt} USDT × {cfg.leverage}x</code>\n"
-        f"🛑 SL: <code>±{cfg.atr_mult}×ATR</code> automático en exchange\n"
-        f"🎯 TP1: <code>±{cfg.rr}×ATR</code> (50%) | TP2: <code>±{cfg.tp2_mult}×ATR</code> (50%)\n"
-        f"🔒 Breakeven: al <code>{cfg.be_trigger:.0%}</code> del camino\n"
-        f"📐 Period: <code>{cfg.period}</code> | Max pos: <code>{cfg.max_positions}</code>"
+    await notify(
+        f"*Three Step Bot v3.0 Started* 🚀\n"
+        f"TF: `{cfg.timeframe}` | RR: `1:{cfg.rr}` | ×`{cfg.leverage}`\n"
+        f"Trade: `{max(cfg.trade_usdt,5)} USDT` | MaxPos: `{cfg.max_positions}`\n"
+        f"Symbols: `{len(cfg.symbols)}` | Balance: `{bal:.2f} USDT`\n"
+        f"Filters: vol≥`{cfg.min_volume_mult}x` | trend=`{cfg.trend_filter}`"
     )
 
-    # Sincronizar posiciones existentes
     await sync_from_exchange()
 
-    while True:
+    loop = asyncio.get_event_loop()
+    stop_event = asyncio.Event()
+
+    def _shutdown(*_):
+        logger.info("SIGTERM received — shutting down")
+        stop_event.set()
+
+    for s in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(s, _shutdown)
+
+    while not stop_event.is_set():
         try:
-            t0 = asyncio.get_event_loop().time()
+            t0 = loop.time()
             await scan_cycle()
-            await maybe_send_stats()
-            elapsed   = asyncio.get_event_loop().time() - t0
+            elapsed = loop.time() - t0
             sleep_for = max(0, cfg.scan_interval - elapsed)
-            logger.info(f"Ciclo en {elapsed:.1f}s | próximo en {sleep_for:.0f}s")
-            await asyncio.sleep(sleep_for)
+            logger.info(f"Cycle {elapsed:.1f}s | next in {sleep_for:.0f}s")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
+            except asyncio.TimeoutError:
+                pass
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error(f"[LOOP ERROR] {e}")
-            notify(f"🆘 <b>BOT ERROR</b>\n<code>{str(e)[:300]}</code>")
+            await notify(f"⚠️ Loop error: {e}")
             await asyncio.sleep(30)
+
+    logger.info("Bot stopped")
+    await ex.close_session()
 
 
 if __name__ == "__main__":

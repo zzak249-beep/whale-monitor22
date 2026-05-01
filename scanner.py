@@ -1,41 +1,23 @@
-"""
-THREE STEP BOT — scanner.py
-============================
-Descarga velas OHLCV para todos los símbolos en paralelo.
-"""
+# -*- coding: utf-8 -*-
+"""scanner.py -- Concurrent OHLCV fetcher."""
 from __future__ import annotations
 import asyncio
-from typing import Dict
-
 from loguru import logger
-import client as ex
+from client import fetch_ohlcv
 
 
-async def fetch_universe(
-    symbols: list[str],
-    timeframe: str,
-    max_concurrent: int = 8,
-    limit: int = 150,
-) -> Dict[str, dict]:
-    """
-    Descarga velas para todos los símbolos con semáforo controlado.
-    Retorna dict {symbol: {"candles": [...]}}
-    """
-    sem     = asyncio.Semaphore(max_concurrent)
-    results = {}
+async def fetch_universe(symbols: list[str], timeframe: str,
+                         max_concurrent: int = 15) -> dict[str, dict]:
+    results: dict[str, dict] = {}
+    sem = asyncio.Semaphore(max_concurrent)
 
-    async def _fetch_one(sym: str):
+    async def _one(sym: str) -> None:
         async with sem:
-            try:
-                candles = await ex.get_klines(sym, timeframe, limit)
-                if len(candles) >= 30:
-                    results[sym] = {"candles": candles}
-                else:
-                    logger.warning(f"[SCANNER] {sym}: solo {len(candles)} velas")
-            except Exception as e:
-                logger.warning(f"[SCANNER] {sym}: {e}")
-            await asyncio.sleep(0.1)
+            data = await fetch_ohlcv(sym, timeframe, limit=300)
+            if data is not None:
+                results[sym] = data
 
-    await asyncio.gather(*[_fetch_one(s) for s in symbols])
-    logger.debug(f"[SCANNER] OK: {len(results)}/{len(symbols)} símbolos")
+    await asyncio.gather(*[asyncio.create_task(_one(s)) for s in symbols],
+                         return_exceptions=True)
+    logger.debug(f"Fetched {len(results)}/{len(symbols)} symbols")
     return results
