@@ -1,171 +1,310 @@
-# -*- coding: utf-8 -*-
-"""pos_manager.py -- Position lifecycle: breakeven, partial close, trailing exit.
-
-Flow per open trade on each scan cycle:
-  1. Fetch live price
-  2. If profit >= 1R  and not yet at BE:
-       - Cancel open SL order
-       - Place new SL at entry (breakeven)
-       - Close 50 % of position (partial TP)
-       - Mark be_done = True
-  3. If be_done and delta1 flips against trade:
-       - Close remaining position (trailing exit)
+"""
+THREE STEP BOT — pos_manager.py
+=================================
+Gestión completa de posiciones:
+  • Trade dataclass con estado completo
+  • Breakeven automático al llegar al 50% del recorrido TP1
+  • TP parcial (50% en TP1, resto en TP2)
+  • Trail con ATR
+  • Notificación de TODAS las entradas y salidas con PnL real
+  • Sincronización con el exchange al arrancar
 """
 from __future__ import annotations
-
 import asyncio
+import time
 from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
 from loguru import logger
 
+from config import cfg
 import client as ex
-from notifier import notify
-from strategy import delta1_flipped
+from notifier import (
+    notify_tp, notify_stop, notify_breakeven, notify_error,
+)
+
+# ── Estado global ─────────────────────────────────────────────────────────────
+_TRADES:     Dict[str, "Trade"] = {}   # symbol → Trade
+_CLOSED:     List[dict]         = []   # historial de trades cerrados
+_STATS = {"wins": 0, "losses": 0, "total_pnl": 0.0}
 
 
 @dataclass
 class Trade:
-    symbol:      str
-    side:        str          # "BUY" | "SELL"
-    entry:       float
-    sl:          float
-    tp:          float
-    atr:         float
-    size_usdt:   float
-    qty:         float = 0.0  # filled quantity (units)
-    be_done:     bool  = False
-    partial_done: bool = False
-    closed:      bool  = False
-    order_id:    str   = ""
+    symbol:    str
+    side:      str        # BUY | SELL
+    entry:     float
+    sl:        float
+    tp:        float      # TP1
+    tp2:       float      # TP2
+    atr:       float
+    size_usdt: float
+    qty:       float
+    order_id:  str = ""
+
+    # Estado interno
+    be_triggered:   bool  = False   # ¿ya se movió stop a breakeven?
+    tp1_hit:        bool  = False   # ¿ya se cerró el 50% en TP1?
+    qty_remaining:  float = 0.0     # qty que queda tras TP1 parcial
+    open_time:      float = field(default_factory=time.time)
+    high_water:     float = 0.0     # precio máximo favorable visto
+    sl_current:     float = 0.0     # SL actual (puede haberse movido)
+
+    def __post_init__(self):
+        self.qty_remaining = self.qty
+        self.sl_current    = self.sl
+        self.high_water    = self.entry
+
+    @property
+    def is_long(self) -> bool:
+        return self.side == "BUY"
+
+    def calc_pnl(self, exit_price: float, qty: float | None = None) -> tuple[float, float]:
+        """Retorna (pnl_usdt, pnl_pct)."""
+        q      = qty if qty is not None else self.qty_remaining
+        pnl    = (exit_price - self.entry) * q if self.is_long else (self.entry - exit_price) * q
+        pnl_pct = pnl / (self.entry * q + 1e-10) * 100
+        return round(pnl, 4), round(pnl_pct, 3)
+
+    def sl_distance(self) -> float:
+        return abs(self.entry - self.sl_current)
+
+    def tp1_reached(self, high: float, low: float) -> bool:
+        if self.tp1_hit:
+            return False
+        return (self.is_long and high >= self.tp) or (not self.is_long and low <= self.tp)
+
+    def tp2_reached(self, high: float, low: float) -> bool:
+        return (self.is_long and high >= self.tp2) or (not self.is_long and low <= self.tp2)
+
+    def sl_hit(self, high: float, low: float) -> bool:
+        return (self.is_long and low <= self.sl_current) or (not self.is_long and high >= self.sl_current)
+
+    def should_breakeven(self, price: float) -> bool:
+        """True cuando el precio avanzó ≥50% del recorrido entry→TP1."""
+        if self.be_triggered:
+            return False
+        progress = abs(price - self.entry) / (abs(self.tp - self.entry) + 1e-10)
+        return progress >= cfg.be_trigger - 1e-9
+
+    def trail_stop(self, price: float) -> float:
+        """
+        Trail con ATR: actualiza sl_current si el precio avanzó más.
+        Solo activo después del breakeven.
+        """
+        if not self.be_triggered:
+            return self.sl_current
+        if self.is_long:
+            new_sl = price - self.atr * cfg.atr_mult
+            if new_sl > self.sl_current:
+                self.sl_current = new_sl
+        else:
+            new_sl = price + self.atr * cfg.atr_mult
+            if new_sl < self.sl_current:
+                self.sl_current = new_sl
+        return self.sl_current
 
 
-# In-memory registry  {symbol: Trade}
-_trades: dict[str, Trade] = {}
+# ── API pública ───────────────────────────────────────────────────────────────
+
+def add_trade(trade: Trade):
+    _TRADES[trade.symbol] = trade
+    logger.info(f"[POS] Registrado: {trade.symbol} {trade.side} qty={trade.qty}")
 
 
-def add_trade(trade: Trade) -> None:
-    _trades[trade.symbol] = trade
-
-
-def remove_trade(symbol: str) -> None:
-    _trades.pop(symbol, None)
-
-
-def open_symbols() -> set[str]:
-    return set(_trades.keys())
+def open_symbols() -> List[str]:
+    return list(_TRADES.keys())
 
 
 def trade_count() -> int:
-    return len(_trades)
+    return len(_TRADES)
 
 
-async def sync_from_exchange() -> None:
-    """On startup, re-import any live positions that survived a restart."""
-    live = await ex.get_all_positions()
-    for sym, pos in live.items():
-        if sym in _trades:
+def get_stats() -> dict:
+    return {**_STATS, "open": trade_count()}
+
+
+# ── Manage positions (llamado cada ciclo) ─────────────────────────────────────
+
+async def manage_positions(ohlcv_map: Dict[str, dict]) -> None:
+    """
+    Revisa todas las posiciones abiertas contra las velas actuales.
+    Lógica:
+      1. Breakeven automático
+      2. TP1 parcial (50% de qty)
+      3. TP2 o stop loss (resto)
+      4. Trail ATR post-breakeven
+    """
+    for sym in list(_TRADES.keys()):
+        trade = _TRADES.get(sym)
+        if not trade:
             continue
-        amt  = float(pos.get("positionAmt", 0))
-        side = "BUY" if amt > 0 else "SELL"
-        ep   = float(pos.get("avgPrice", 0))
-        if ep <= 0:
+        ohlcv = ohlcv_map.get(sym)
+        if not ohlcv or not ohlcv.get("candles"):
             continue
-        t = Trade(
-            symbol=sym, side=side, entry=ep, sl=0.0, tp=0.0, atr=0.0,
-            size_usdt=0.0, qty=abs(amt), be_done=True, partial_done=True,
+
+        candles = ohlcv["candles"]
+        last    = candles[-1]
+        price   = float(last["close"])
+        high    = float(last["high"])
+        low     = float(last["low"])
+
+        try:
+            await _process_trade(trade, price, high, low)
+        except Exception as e:
+            logger.error(f"[POS] Error en {sym}: {e}")
+            notify_error(sym, str(e))
+
+
+async def _process_trade(trade: Trade, price: float, high: float, low: float):
+    sym = trade.symbol
+
+    # ── Trail stop ────────────────────────────────────────────────────────────
+    new_sl = trade.trail_stop(price)
+    if new_sl != trade.sl_current:
+        logger.debug(f"[TRAIL] {sym} SL → {new_sl:.6g}")
+
+    # ── Breakeven ─────────────────────────────────────────────────────────────
+    if not trade.be_triggered and trade.should_breakeven(price):
+        trade.be_triggered = True
+        trade.sl_current   = trade.entry
+        logger.info(f"[BE] {sym} stop → breakeven @ {trade.entry:.6g}")
+        notify_breakeven(sym, trade.entry)
+        # Cancelar SL anterior y colocar nuevo en exchange
+        await ex.cancel_all_orders(sym)
+        # Recolocar SL en breakeven
+        sl_side  = "SELL" if trade.is_long else "BUY"
+        pos_side = "LONG" if trade.is_long else "SHORT"
+        try:
+            await ex._post("/openApi/swap/v2/trade/order", {
+                "symbol":       sym,
+                "side":         sl_side,
+                "positionSide": pos_side,
+                "type":         "STOP_MARKET",
+                "quantity":     round(trade.qty_remaining, 4),
+                "stopPrice":    round(trade.entry, 6),
+                "workingType":  "MARK_PRICE",
+            })
+        except Exception as e:
+            logger.warning(f"[BE] Recolocar SL error: {e}")
+
+    # ── Stop loss hit ─────────────────────────────────────────────────────────
+    if trade.sl_hit(high, low):
+        exit_price = trade.sl_current
+        pnl, pnl_pct = trade.calc_pnl(exit_price, trade.qty_remaining)
+
+        logger.info(f"[SL] {sym} @ {exit_price:.6g} | PnL={pnl:+.4f} USDT ({pnl_pct:+.2f}%)")
+
+        if not cfg.testnet:
+            await ex.close_position(sym, "LONG" if trade.is_long else "SHORT", trade.qty_remaining)
+
+        reason = "STOP LOSS" if pnl < 0 else "STOP (breakeven/profit)"
+        notify_stop(
+            symbol=sym, side=trade.side, stop_price=exit_price,
+            entry=trade.entry, qty=trade.qty_remaining,
+            pnl_usdt=pnl, pnl_pct=pnl_pct, reason=reason,
         )
-        _trades[sym] = t
-        logger.info(f"[SYNC] re-imported {sym} {side} @ {ep}")
-        await notify(f"[SYNC] Re-imported {sym} {side} @ {ep}")
-
-
-async def _close_partial(trade: Trade, live_pos: dict) -> None:
-    """Close cfg.partial_pct of position."""
-    from config import cfg
-    qty = trade.qty * cfg.partial_pct
-    if qty <= 0:
+        _record_close(trade, exit_price, pnl, "STOP")
+        _TRADES.pop(sym, None)
         return
-    close_side = "SELL" if trade.side == "BUY" else "BUY"
-    resp = await ex.place_reduce_order(trade.symbol, close_side, round(qty, 6))
-    code = resp.get("code", -1)
-    if code in (0, 200):
-        trade.qty -= qty
-        trade.partial_done = True
-        logger.info(f"[PARTIAL] {trade.symbol} closed {qty:.6f} units")
-        await notify(
-            f"*[PARTIAL TP]* {trade.symbol}\n"
-            f"Closed {cfg.partial_pct*100:.0f}% | remaining qty={trade.qty:.6f}"
+
+    # ── TP1 parcial ───────────────────────────────────────────────────────────
+    if not trade.tp1_hit and trade.tp1_reached(high, low):
+        qty_close = round(trade.qty * (cfg.partial_pct / 100), 4)
+        exit_price = trade.tp
+
+        pnl, pnl_pct = trade.calc_pnl(exit_price, qty_close)
+        logger.info(f"[TP1] {sym} @ {exit_price:.6g} | qty={qty_close} | PnL={pnl:+.4f} USDT")
+
+        if not cfg.testnet:
+            await ex.close_position(sym, "LONG" if trade.is_long else "SHORT", qty_close)
+
+        trade.tp1_hit       = True
+        trade.qty_remaining = round(trade.qty - qty_close, 4)
+
+        notify_tp(
+            symbol=sym, side=trade.side, tp_num=1, tp_price=exit_price,
+            entry=trade.entry, qty_closed=qty_close,
+            pnl_usdt=pnl, pnl_pct=pnl_pct,
         )
-    else:
-        logger.warning(f"[PARTIAL] {trade.symbol} failed: {resp}")
+        _record_close(trade, exit_price, pnl, "TP1", partial=True)
+        return
+
+    # ── TP2 (resto de la posición) ────────────────────────────────────────────
+    if trade.tp1_hit and trade.tp2_reached(high, low):
+        exit_price = trade.tp2
+        pnl, pnl_pct = trade.calc_pnl(exit_price, trade.qty_remaining)
+
+        logger.info(f"[TP2] {sym} @ {exit_price:.6g} | qty={trade.qty_remaining} | PnL={pnl:+.4f} USDT")
+
+        if not cfg.testnet:
+            await ex.close_position(sym, "LONG" if trade.is_long else "SHORT", trade.qty_remaining)
+
+        notify_tp(
+            symbol=sym, side=trade.side, tp_num=2, tp_price=exit_price,
+            entry=trade.entry, qty_closed=trade.qty_remaining,
+            pnl_usdt=pnl, pnl_pct=pnl_pct,
+        )
+        _record_close(trade, exit_price, pnl, "TP2")
+        _TRADES.pop(sym, None)
+        return
 
 
-async def _move_to_breakeven(trade: Trade) -> None:
-    """Cancel SL orders and re-place at entry price."""
-    await ex.cancel_all_orders(trade.symbol)
-    # BingX doesn't have a dedicated SL-edit endpoint; we rely on the bot's
-    # trailing logic to exit rather than a resting order after BE.
-    trade.be_done = True
-    logger.info(f"[BREAKEVEN] {trade.symbol} SL moved to entry {trade.entry}")
-    await notify(
-        f"*[BREAKEVEN]* {trade.symbol}\n"
-        f"SL moved to entry {trade.entry} | side={trade.side}"
-    )
+def _record_close(trade: Trade, exit_price: float, pnl: float, reason: str, partial: bool = False):
+    """Registra cierre en historial y actualiza stats."""
+    _CLOSED.append({
+        "symbol":   trade.symbol,
+        "side":     trade.side,
+        "entry":    trade.entry,
+        "exit":     exit_price,
+        "pnl":      pnl,
+        "reason":   reason,
+        "partial":  partial,
+        "time":     time.time(),
+    })
+    if not partial:
+        _STATS["total_pnl"] = round(_STATS["total_pnl"] + pnl, 4)
+        if pnl >= 0:
+            _STATS["wins"] += 1
+        else:
+            _STATS["losses"] += 1
 
 
-async def manage_positions(ohlcv_map: dict[str, dict]) -> None:
-    """Called once per scan cycle for every open trade."""
-    from config import cfg
+async def sync_from_exchange():
+    """Al arrancar: sincroniza posiciones existentes en BingX."""
+    try:
+        positions = await ex.get_open_positions()
+        for pos in positions:
+            sym  = pos.get("symbol", "")
+            size = float(pos.get("positionAmt", 0) or 0)
+            if abs(size) < 1e-6 or sym in _TRADES:
+                continue
 
-    closed_symbols: list[str] = []
+            entry = float(pos.get("entryPrice", 0) or 0)
+            side  = "BUY" if size > 0 else "SELL"
+            pos_side_str = "LONG" if size > 0 else "SHORT"
 
-    for sym, trade in list(_trades.items()):
-        if trade.closed:
-            closed_symbols.append(sym)
-            continue
+            if entry <= 0:
+                continue
 
-        price = await ex.get_price(sym)
-        if price <= 0:
-            continue
+            # Estimar ATR y stops desde posición existente
+            mark = float(pos.get("markPrice", entry) or entry)
+            liq  = float(pos.get("liquidationPrice", 0) or 0)
+            # SL estimado: 80% del camino a liquidación
+            sl_est = entry - (entry - liq) * 0.5 if size > 0 else entry + (liq - entry) * 0.5
+            tp_est = entry + (entry - sl_est) * cfg.rr if size > 0 else entry - (sl_est - entry) * cfg.rr
 
-        # Profit in R units
-        r_dist = trade.atr * cfg.atr_mult if trade.atr > 0 else abs(trade.entry - trade.sl)
-        if r_dist <= 0:
-            continue
+            trade = Trade(
+                symbol=sym, side=side,
+                entry=entry, sl=sl_est,
+                tp=tp_est, tp2=tp_est,
+                atr=abs(entry - sl_est) / cfg.atr_mult,
+                size_usdt=cfg.trade_usdt, qty=abs(size),
+                order_id="synced",
+            )
+            _TRADES[sym] = trade
+            logger.info(f"[SYNC] {sym} {pos_side_str} entry={entry:.4f} qty={abs(size):.4f}")
 
-        pnl = (price - trade.entry) if trade.side == "BUY" else (trade.entry - price)
-        r_achieved = pnl / r_dist
-
-        # ── Step 1: Breakeven + partial TP at +1R ────────────────────────
-        if not trade.be_done and r_achieved >= cfg.breakeven_r:
-            live_positions = await ex.get_all_positions()
-            live_pos = live_positions.get(sym, {})
-            if live_pos:
-                await _move_to_breakeven(trade)
-                await _close_partial(trade, live_pos)
-
-        # ── Step 2: Trailing exit when delta1 flips ────────────────────
-        if trade.be_done and sym in ohlcv_map:
-            ohlcv = ohlcv_map[sym]
-            if delta1_flipped(ohlcv, cfg.period, trade.side):
-                live_positions = await ex.get_all_positions()
-                live_pos = live_positions.get(sym, {})
-                if live_pos:
-                    resp = await ex.close_position(sym, live_pos)
-                    code = resp.get("code", -1)
-                    if code in (0, 200):
-                        trade.closed = True
-                        closed_symbols.append(sym)
-                        logger.info(f"[TRAIL EXIT] {sym} closed at {price:.6f} | R={r_achieved:.2f}")
-                        await notify(
-                            f"*[TRAIL EXIT]* {sym}\n"
-                            f"Price={price:.6f} | R={r_achieved:.2f}R\n"
-                            f"Delta1 flipped against {trade.side}"
-                        )
-                else:
-                    # Position already closed (hit SL/TP on exchange)
-                    trade.closed = True
-                    closed_symbols.append(sym)
-                    logger.info(f"[CLOSED] {sym} no longer on exchange (SL/TP hit)")
-
-    for sym in closed_symbols:
-        remove_trade(sym)
+        logger.info(f"[SYNC] {len(_TRADES)} posiciones sincronizadas del exchange")
+    except Exception as e:
+        logger.warning(f"[SYNC] Error: {e}")

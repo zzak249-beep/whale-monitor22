@@ -1,13 +1,7 @@
 [build]
-builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile"
+builder = "nixpacks"
 
 [deploy]
-startCommand = "python -m bot"
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 5
-
-[healthcheck]
-path = "/health"
-intervalSeconds = 30
-timeoutSeconds = 10
+startCommand = "python bot.py"
+restartPolicyType = "always"
+restartPolicyMaxRetries = 10
