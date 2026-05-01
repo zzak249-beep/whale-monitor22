@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
-"""bot.py -- Three Step Bot v3.
+"""bot.py -- Three Step Bot v4.
 
-Key improvements over v2:
-  - Score-based signal prioritization (higher score enters first)
-  - Circuit breaker: halts on daily loss or max trades
-  - Bot-only position mode: ignores external positions
-  - Rich /health endpoint with stats
-  - Graceful SIGTERM shutdown
-  - Min balance guard before every entry
+New in v4:
+  - Uses rich notify_entry/notify_exit instead of generic notify()
+  - SL/TP sanity check before placing order
+  - Leverage hardcoded to 10x as default
+  - Daily summary on startup
+  - Score-sorted signal prioritization
 """
 from __future__ import annotations
 import asyncio
@@ -25,9 +24,8 @@ from pos_manager import (
     Trade, add_trade, open_symbols, trade_count, is_halted,
     manage_positions, sync_from_exchange, get_stats,
 )
-from notifier import notify
+import notifier
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logger.remove()
 logger.add(
     sys.stdout, level="INFO",
@@ -39,12 +37,14 @@ logger.add(
 async def _health(_: web.Request) -> web.Response:
     stats = get_stats()
     return web.json_response({
-        "status":        "halted" if stats["halted"] else "ok",
-        "open_trades":   stats["open"],
-        "daily_trades":  stats["daily_trades"],
-        "daily_pnl":     stats["daily_pnl"],
-        "symbols":       list(open_symbols()),
-        "version":       "3.0",
+        "status":       "halted" if stats["halted"] else "ok",
+        "version":      "4.0",
+        "open_trades":  stats["open"],
+        "daily_trades": stats["daily_trades"],
+        "daily_pnl":    stats["daily_pnl"],
+        "daily_wins":   stats["daily_wins"],
+        "daily_losses": stats["daily_losses"],
+        "symbols":      list(open_symbols()),
     })
 
 
@@ -56,7 +56,7 @@ async def start_health_server() -> None:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", cfg.health_port)
     await site.start()
-    logger.info(f"Health server on :{cfg.health_port}")
+    logger.info(f"Health :{cfg.health_port}")
 
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
@@ -64,24 +64,36 @@ async def enter_trade(sig) -> None:
     if sig.symbol in open_symbols():
         return
     if trade_count() >= cfg.max_positions:
-        logger.debug(f"[SKIP] {sig.symbol} — max positions ({cfg.max_positions})")
+        logger.debug(f"[SKIP] {sig.symbol} — max pos {cfg.max_positions}")
         return
     if is_halted():
-        logger.warning(f"[SKIP] {sig.symbol} — bot halted (circuit breaker)")
         return
 
-    size = max(cfg.trade_usdt, 5.0)
-    required_margin = (size / cfg.leverage) * 1.3
+    size     = max(cfg.trade_usdt, 5.0)
+    leverage = cfg.leverage  # 10 by default
+    margin   = (size / leverage) * 1.3
 
     bal = await ex.get_balance()
-    if bal < cfg.min_balance_usdt:
-        logger.warning(f"[SKIP] {sig.symbol} — balance {bal:.2f} < min {cfg.min_balance_usdt}")
-        return
-    if bal < required_margin:
-        logger.warning(f"[SKIP] {sig.symbol} — need {required_margin:.2f} USDT, have {bal:.2f}")
+    if bal < cfg.min_balance_usdt or bal < margin:
+        logger.warning(f"[SKIP] {sig.symbol} — balance {bal:.2f} < {max(cfg.min_balance_usdt, margin):.2f}")
         return
 
-    await ex.set_leverage(sig.symbol, cfg.leverage)
+    # ── SL/TP sanity check ────────────────────────────────────────────────
+    if sig.side == "BUY":
+        if sig.sl >= sig.price or sig.tp <= sig.price:
+            logger.warning(f"[SKIP] {sig.symbol} — invalid SL/TP for BUY")
+            return
+    else:
+        if sig.sl <= sig.price or sig.tp >= sig.price:
+            logger.warning(f"[SKIP] {sig.symbol} — invalid SL/TP for SELL")
+            return
+
+    sl_dist_pct = abs(sig.price - sig.sl) / sig.price * 100
+    if sl_dist_pct < 0.1:
+        logger.warning(f"[SKIP] {sig.symbol} — SL too close ({sl_dist_pct:.3f}%)")
+        return
+
+    await ex.set_leverage(sig.symbol, leverage)
     await asyncio.sleep(0.3)
 
     resp = await ex.place_market_order(
@@ -90,7 +102,7 @@ async def enter_trade(sig) -> None:
     )
     code = resp.get("code", -1)
     if code not in (0, 200, None):
-        logger.warning(f"[ORDER FAIL] {sig.symbol} code={code} {resp.get('msg','')}")
+        logger.warning(f"[FAIL] {sig.symbol} code={code} {resp.get('msg','')}")
         return
 
     order_data = resp.get("data", {})
@@ -98,47 +110,45 @@ async def enter_trade(sig) -> None:
         order_data = order_data.get("order", order_data)
     qty = float(order_data.get("executedQty", 0) or order_data.get("origQty", 0))
     if qty <= 0:
-        qty = (size * cfg.leverage) / sig.price
+        qty = (size * leverage) / sig.price
 
     trade = Trade(
         symbol=sig.symbol, side=sig.side,
         entry=sig.price, sl=sig.sl, tp=sig.tp,
-        atr=sig.atr, size_usdt=size, qty=qty,
-        score=sig.score, order_id=str(order_data.get("orderId", "")),
+        atr=sig.atr, size_usdt=size, leverage=leverage,
+        qty=qty, score=sig.score, vol_ratio=sig.vol_ratio,
+        delta1=sig.delta1, delta2=sig.delta2,
+        order_id=str(order_data.get("orderId", "")),
         bot_opened=True,
     )
     add_trade(trade)
 
-    stars = "⭐" * sig.score
     logger.success(
         f"[ENTRY] {sig.symbol} {sig.side} @ {sig.price:.6f} "
         f"SL={sig.sl:.6f} TP={sig.tp:.6f} score={sig.score}/5"
     )
-    await notify(
-        f"🚀 *[ENTRY]* {sig.symbol} `{sig.side}` {stars}\n"
-        f"Price: `{sig.price:.6f}`\n"
-        f"SL: `{sig.sl:.6f}` | TP: `{sig.tp:.6f}`\n"
-        f"Size: `{size} USDT ×{cfg.leverage}` | Vol: `{sig.vol_ratio:.1f}x`\n"
-        f"Δ1: `{sig.delta1:+.0f}` Δ2: `{sig.delta2:+.0f}` Score: `{sig.score}/5`"
+    await notifier.notify_entry(
+        symbol=sig.symbol, side=sig.side, price=sig.price,
+        sl=sig.sl, tp=sig.tp, size_usdt=size,
+        leverage=leverage, qty=qty, score=sig.score,
+        delta1=sig.delta1, delta2=sig.delta2, vol_ratio=sig.vol_ratio,
     )
 
 
-# ── Scan cycle ────────────────────────────────────────────────────────────────
+# ── Scan ──────────────────────────────────────────────────────────────────────
 async def scan_cycle() -> None:
     if is_halted():
-        logger.warning("[HALTED] Skipping scan cycle — circuit breaker active")
         return
 
     symbols = cfg.symbols
     logger.info(
-        f"Scanning {len(symbols)} symbols | TF={cfg.timeframe} "
+        f"Scan {len(symbols)} símbolos | TF={cfg.timeframe} "
         f"open={trade_count()}/{cfg.max_positions}"
     )
 
     ohlcv_map = await fetch_universe(symbols, cfg.timeframe, cfg.max_concurrent)
     await manage_positions(ohlcv_map)
 
-    # Collect all signals, sort by score (best first)
     signals = []
     for sym, ohlcv in ohlcv_map.items():
         if sym in open_symbols():
@@ -156,7 +166,6 @@ async def scan_cycle() -> None:
         if sig:
             signals.append(sig)
 
-    # Sort by score descending — best signals enter first
     signals.sort(key=lambda s: s.score, reverse=True)
 
     for sig in signals:
@@ -164,7 +173,7 @@ async def scan_cycle() -> None:
             break
         logger.info(
             f"[SIGNAL] {sig.symbol} {sig.side} score={sig.score}/5 "
-            f"vol={sig.vol_ratio:.1f}x | Δ1={sig.delta1:+.0f} Δ2={sig.delta2:+.0f}"
+            f"vol={sig.vol_ratio:.1f}x Δ1={sig.delta1:+.0f}"
         )
         await enter_trade(sig)
 
@@ -174,23 +183,22 @@ async def main_loop() -> None:
     await start_health_server()
 
     logger.info("=" * 62)
-    logger.info("  THREE STEP BOT  v3.0  — Professional Edition")
-    logger.info(f"  TF={cfg.timeframe} | Period={cfg.period} | ATR×{cfg.atr_mult} | RR={cfg.rr}")
-    logger.info(f"  Trade={max(cfg.trade_usdt,5)}USDT ×{cfg.leverage} | MaxPos={cfg.max_positions}")
-    logger.info(f"  Filters: vol≥{cfg.min_volume_mult}x | trend={cfg.trend_filter} | atr≥{cfg.min_atr_pct}%")
-    logger.info(f"  Risk: maxLoss={cfg.max_daily_loss_pct}% | maxTrades={cfg.max_daily_trades}/day")
-    logger.info(f"  Symbols ({len(cfg.symbols)}): {', '.join(cfg.symbols)}")
+    logger.info("  THREE STEP BOT v4.0")
+    logger.info(f"  TF={cfg.timeframe} | ATR×{cfg.atr_mult} | RR=1:{cfg.rr} | ×{cfg.leverage}")
+    logger.info(f"  Trade={max(cfg.trade_usdt,5)}USDT | MaxPos={cfg.max_positions}")
+    logger.info(f"  Symbols: {len(cfg.symbols)}")
     logger.info("=" * 62)
 
     bal = await ex.get_balance()
     logger.info(f"  Balance: {bal:.2f} USDT")
 
-    await notify(
-        f"*Three Step Bot v3.0 Started* 🚀\n"
+    await notifier.notify(
+        f"*Three Step Bot v4.0* 🚀\n"
         f"TF: `{cfg.timeframe}` | RR: `1:{cfg.rr}` | ×`{cfg.leverage}`\n"
         f"Trade: `{max(cfg.trade_usdt,5)} USDT` | MaxPos: `{cfg.max_positions}`\n"
-        f"Symbols: `{len(cfg.symbols)}` | Balance: `{bal:.2f} USDT`\n"
-        f"Filters: vol≥`{cfg.min_volume_mult}x` | trend=`{cfg.trend_filter}`"
+        f"Símbolos: `{len(cfg.symbols)}` | Balance: `{bal:.2f} USDT`\n\n"
+        f"📊 Recibirás notificaciones de:\n"
+        f"🚀 Entradas | 🔒 Breakeven | ✂️ Parcial | 🎯 Salidas | 📈 Resumen diario"
     )
 
     await sync_from_exchange()
@@ -199,7 +207,6 @@ async def main_loop() -> None:
     stop_event = asyncio.Event()
 
     def _shutdown(*_):
-        logger.info("SIGTERM received — shutting down")
         stop_event.set()
 
     for s in (signal.SIGTERM, signal.SIGINT):
@@ -211,7 +218,7 @@ async def main_loop() -> None:
             await scan_cycle()
             elapsed = loop.time() - t0
             sleep_for = max(0, cfg.scan_interval - elapsed)
-            logger.info(f"Cycle {elapsed:.1f}s | next in {sleep_for:.0f}s")
+            logger.info(f"Ciclo {elapsed:.1f}s | siguiente en {sleep_for:.0f}s")
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
             except asyncio.TimeoutError:
@@ -219,11 +226,11 @@ async def main_loop() -> None:
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"[LOOP ERROR] {e}")
-            await notify(f"⚠️ Loop error: {e}")
+            logger.error(f"[ERROR] {e}")
+            await notifier.notify(f"⚠️ Error: {e}")
             await asyncio.sleep(30)
 
-    logger.info("Bot stopped")
+    logger.info("Bot detenido")
     await ex.close_session()
 
 
