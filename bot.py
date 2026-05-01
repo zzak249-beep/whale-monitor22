@@ -7,6 +7,7 @@ New in v4:
   - Leverage hardcoded to 10x as default
   - Daily summary on startup
   - Score-sorted signal prioritization
+  - Telegram connection test on startup (v4.1)
 """
 from __future__ import annotations
 import asyncio
@@ -38,7 +39,7 @@ async def _health(_: web.Request) -> web.Response:
     stats = get_stats()
     return web.json_response({
         "status":       "halted" if stats["halted"] else "ok",
-        "version":      "4.0",
+        "version":      "4.1",
         "open_trades":  stats["open"],
         "daily_trades": stats["daily_trades"],
         "daily_pnl":    stats["daily_pnl"],
@@ -64,33 +65,33 @@ async def enter_trade(sig) -> None:
     if sig.symbol in open_symbols():
         return
     if trade_count() >= cfg.max_positions:
-        logger.debug(f"[SKIP] {sig.symbol} — max pos {cfg.max_positions}")
+        logger.debug(f"[SKIP] {sig.symbol} -- max pos {cfg.max_positions}")
         return
     if is_halted():
         return
 
     size     = max(cfg.trade_usdt, 5.0)
-    leverage = cfg.leverage  # 10 by default
+    leverage = cfg.leverage  # 10x default
     margin   = (size / leverage) * 1.3
 
     bal = await ex.get_balance()
     if bal < cfg.min_balance_usdt or bal < margin:
-        logger.warning(f"[SKIP] {sig.symbol} — balance {bal:.2f} < {max(cfg.min_balance_usdt, margin):.2f}")
+        logger.warning(f"[SKIP] {sig.symbol} -- balance {bal:.2f} < {max(cfg.min_balance_usdt, margin):.2f}")
         return
 
-    # ── SL/TP sanity check ────────────────────────────────────────────────
+    # SL/TP sanity check
     if sig.side == "BUY":
         if sig.sl >= sig.price or sig.tp <= sig.price:
-            logger.warning(f"[SKIP] {sig.symbol} — invalid SL/TP for BUY")
+            logger.warning(f"[SKIP] {sig.symbol} -- SL/TP invalido para BUY")
             return
     else:
         if sig.sl <= sig.price or sig.tp >= sig.price:
-            logger.warning(f"[SKIP] {sig.symbol} — invalid SL/TP for SELL")
+            logger.warning(f"[SKIP] {sig.symbol} -- SL/TP invalido para SELL")
             return
 
     sl_dist_pct = abs(sig.price - sig.sl) / sig.price * 100
     if sl_dist_pct < 0.1:
-        logger.warning(f"[SKIP] {sig.symbol} — SL too close ({sl_dist_pct:.3f}%)")
+        logger.warning(f"[SKIP] {sig.symbol} -- SL muy cerca ({sl_dist_pct:.3f}%)")
         return
 
     await ex.set_leverage(sig.symbol, leverage)
@@ -142,7 +143,7 @@ async def scan_cycle() -> None:
 
     symbols = cfg.symbols
     logger.info(
-        f"Scan {len(symbols)} símbolos | TF={cfg.timeframe} "
+        f"Scan {len(symbols)} simbolos | TF={cfg.timeframe} "
         f"open={trade_count()}/{cfg.max_positions}"
     )
 
@@ -173,7 +174,7 @@ async def scan_cycle() -> None:
             break
         logger.info(
             f"[SIGNAL] {sig.symbol} {sig.side} score={sig.score}/5 "
-            f"vol={sig.vol_ratio:.1f}x Δ1={sig.delta1:+.0f}"
+            f"vol={sig.vol_ratio:.1f}x D1={sig.delta1:+.0f}"
         )
         await enter_trade(sig)
 
@@ -183,22 +184,23 @@ async def main_loop() -> None:
     await start_health_server()
 
     logger.info("=" * 62)
-    logger.info("  THREE STEP BOT v4.0")
-    logger.info(f"  TF={cfg.timeframe} | ATR×{cfg.atr_mult} | RR=1:{cfg.rr} | ×{cfg.leverage}")
+    logger.info("  THREE STEP BOT v4.1")
+    logger.info(f"  TF={cfg.timeframe} | ATR x{cfg.atr_mult} | RR=1:{cfg.rr} | x{cfg.leverage}")
     logger.info(f"  Trade={max(cfg.trade_usdt,5)}USDT | MaxPos={cfg.max_positions}")
-    logger.info(f"  Symbols: {len(cfg.symbols)}")
+    logger.info(f"  Simbolos: {len(cfg.symbols)}")
     logger.info("=" * 62)
 
     bal = await ex.get_balance()
     logger.info(f"  Balance: {bal:.2f} USDT")
 
+    # Test Telegram connection before anything else
+    await notifier.test_telegram()
+
     await notifier.notify(
-        f"*Three Step Bot v4.0* 🚀\n"
-        f"TF: `{cfg.timeframe}` | RR: `1:{cfg.rr}` | ×`{cfg.leverage}`\n"
-        f"Trade: `{max(cfg.trade_usdt,5)} USDT` | MaxPos: `{cfg.max_positions}`\n"
-        f"Símbolos: `{len(cfg.symbols)}` | Balance: `{bal:.2f} USDT`\n\n"
-        f"📊 Recibirás notificaciones de:\n"
-        f"🚀 Entradas | 🔒 Breakeven | ✂️ Parcial | 🎯 Salidas | 📈 Resumen diario"
+        f"Three Step Bot v4.1 iniciado\n"
+        f"TF: {cfg.timeframe} | RR: 1:{cfg.rr} | x{cfg.leverage}\n"
+        f"Trade: {max(cfg.trade_usdt,5)} USDT | MaxPos: {cfg.max_positions}\n"
+        f"Simbolos: {len(cfg.symbols)} | Balance: {bal:.2f} USDT"
     )
 
     await sync_from_exchange()
@@ -227,7 +229,7 @@ async def main_loop() -> None:
             break
         except Exception as e:
             logger.error(f"[ERROR] {e}")
-            await notifier.notify(f"⚠️ Error: {e}")
+            await notifier.notify(f"Error: {e}")
             await asyncio.sleep(30)
 
     logger.info("Bot detenido")
