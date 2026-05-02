@@ -1,104 +1,43 @@
 # -*- coding: utf-8 -*-
-"""notifier.py -- Three Step Bot v4 -- Rich Telegram Notifications (FIXED).
+"""notifier.py -- Three Step Bot v4 — Rich Telegram Notifications.
 
-Fixes:
-  - Switched to MarkdownV2 with proper escaping (old Markdown silently fails)
-  - Retry logic (3 attempts) on network errors
-  - test_telegram() for startup diagnostics
-  - Full error body logged on failure
+Sends detailed trade reports:
+  - ENTRY: symbol, side, price, SL, TP, size, score
+  - BREAKEVEN: moved SL to entry
+  - PARTIAL TP: closed 50%, amount received
+  - EXIT (trail/SL/TP): price, R achieved, PnL in USDT, win/loss emoji
+  - DAILY SUMMARY: total trades, wins, losses, net PnL
+  - HALT/RESUME: circuit breaker alerts
 """
 from __future__ import annotations
-import asyncio
-import re
 import aiohttp
 from loguru import logger
 
 
-# ── MarkdownV2 escaping ───────────────────────────────────────────────────────
-_MD_SPECIAL = r'\_*[]()~`>#+-=|{}.!'
-
-def _esc(text: str) -> str:
-    """Escape special chars for Telegram MarkdownV2."""
-    return re.sub(r'([_\*\[\]()~`>#+\-=|{}.!])', r'\\\1', str(text))
-
-
-def _fmt(n: float, decimals: int = 6) -> str:
-    return _esc(f"{n:.{decimals}f}")
-
-def _fmtp(n: float) -> str:
-    return _esc(f"{n:+.2f}")
-
-def _fmtu(n: float) -> str:
-    return _esc(f"{n:+.4f}")
-
-
-# ── Core sender ───────────────────────────────────────────────────────────────
-
-async def _send(text: str, retries: int = 3) -> bool:
+async def _send(text: str) -> None:
     from config import cfg
     if not cfg.telegram_token or not cfg.telegram_chat_id:
-        logger.warning("[TELEGRAM] Token o chat_id no configurados")
-        return False
-
-    url = f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage"
-    payload = {
-        "chat_id":    cfg.telegram_chat_id,
-        "text":       text,
-        "parse_mode": "MarkdownV2",
-    }
-
-    for attempt in range(1, retries + 1):
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(
-                    url, json=payload,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as r:
-                    body = await r.text()
-                    if r.status == 200:
-                        return True
-                    logger.warning(
-                        f"[TELEGRAM] HTTP {r.status} intento {attempt}/{retries}: {body[:200]}"
-                    )
-                    # Bad Request = formatting error, no reintentar
-                    if r.status == 400:
-                        logger.error(f"[TELEGRAM] Mensaje con error de formato:\n{text[:300]}")
-                        return False
-        except asyncio.TimeoutError:
-            logger.warning(f"[TELEGRAM] Timeout intento {attempt}/{retries}")
-        except Exception as e:
-            logger.warning(f"[TELEGRAM] Error intento {attempt}/{retries}: {e}")
-
-        if attempt < retries:
-            await asyncio.sleep(2 ** attempt)
-
-    return False
-
-
-# ── Startup test ──────────────────────────────────────────────────────────────
-
-async def test_telegram() -> None:
-    """Call on startup to verify Telegram connection."""
-    from config import cfg
-    logger.info("[TELEGRAM] Probando conexion...")
-    if not cfg.telegram_token or not cfg.telegram_chat_id:
-        logger.error("[TELEGRAM] TELEGRAM_TOKEN o TELEGRAM_CHAT_ID vacios en variables de entorno")
         return
-    ok = await _send(
-        "*Three Step Bot v4* \\- Telegram OK ✅\n"
-        "Notificaciones de entradas/salidas activas\\."
-    )
-    if ok:
-        logger.success("[TELEGRAM] Conexion OK")
-    else:
-        logger.error("[TELEGRAM] FALLO \\- revisa token y chat_id en Railway Variables")
+    url = f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, json={
+                "chat_id":    cfg.telegram_chat_id,
+                "text":       text,
+                "parse_mode": "Markdown",
+            }, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    logger.warning(f"Telegram {r.status}: {body[:120]}")
+    except Exception as e:
+        logger.warning(f"Telegram failed: {e}")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 async def notify(text: str) -> None:
-    """Generic notification -- auto-escapes plain text."""
-    await _send(_esc(text))
+    """Generic notification."""
+    await _send(text)
 
 
 async def notify_entry(
@@ -107,37 +46,33 @@ async def notify_entry(
     leverage: int, qty: float, score: int,
     delta1: float, delta2: float, vol_ratio: float,
 ) -> None:
-    side_emoji = "BUY  LONG" if side == "BUY" else "SELL SHORT"
-    stars = "★" * score + "☆" * (5 - score)
+    side_emoji = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+    stars = "⭐" * score
     sl_pct = abs(price - sl) / price * 100
     tp_pct = abs(tp - price) / price * 100
     rr = round(tp_pct / sl_pct, 1) if sl_pct > 0 else 0
     exposure = size_usdt * leverage
 
-    text = (
-        f"🚀 *ENTRADA* \\— `{_esc(symbol)}`\n"
-        f"┣ Dir: *{_esc(side_emoji)}*\n"
-        f"┣ Precio:  `{_fmt(price)}`\n"
-        f"┣ SL:      `{_fmt(sl)}` \\({_fmtp(-sl_pct)}%\\)\n"
-        f"┣ TP:      `{_fmt(tp)}` \\(\\+{_esc(f'{tp_pct:.2f}')}%\\)\n"
-        f"┣ RR: `1:{_esc(str(rr))}` \\| Score: `{_esc(stars)}` \\({score}/5\\)\n"
-        f"┣ Tamaño: `{_esc(str(size_usdt))} USDT ×{leverage}` \\= `{_esc(f'{exposure:.0f}')} exp`\n"
-        f"┣ Qty: `{_fmt(qty)}`\n"
-        f"┗ Vol: `{_esc(f'{vol_ratio:.1f}')}x` \\| D1:`{_fmtp(delta1)}` D2:`{_fmtp(delta2)}`"
+    await _send(
+        f"🚀 *ENTRADA* — {symbol}\n"
+        f"┣ Dirección: *{side_emoji}*\n"
+        f"┣ Precio entrada: `{price:.6f}`\n"
+        f"┣ Stop Loss:  `{sl:.6f}` (-{sl_pct:.2f}%)\n"
+        f"┣ Take Profit: `{tp:.6f}` (+{tp_pct:.2f}%)\n"
+        f"┣ RR: `1:{rr}` | Score: {stars} ({score}/5)\n"
+        f"┣ Tamaño: `{size_usdt} USDT ×{leverage}` = `{exposure:.0f} USDT exp.`\n"
+        f"┣ Cantidad: `{qty:.6f}` unidades\n"
+        f"┗ Vol ratio: `{vol_ratio:.1f}x` | Δ1:`{delta1:+.0f}` Δ2:`{delta2:+.0f}`"
     )
-    await _send(text)
 
 
-async def notify_breakeven(
-    symbol: str, side: str, entry: float, r_at_be: float
-) -> None:
-    text = (
-        f"🔒 *BREAKEVEN* \\— `{_esc(symbol)}`\n"
-        f"┣ SL movido a entrada: `{_fmt(entry)}`\n"
-        f"┣ Dir: `{_esc(side)}`\n"
-        f"┗ R actual: `{_esc(f'{r_at_be:.2f}')}R` \\— riesgo eliminado ✅"
+async def notify_breakeven(symbol: str, side: str, entry: float, r_at_be: float) -> None:
+    await _send(
+        f"🔒 *BREAKEVEN* — {symbol}\n"
+        f"┣ SL movido a precio de entrada: `{entry:.6f}`\n"
+        f"┣ Dirección: `{side}`\n"
+        f"┗ R en el momento: `{r_at_be:.2f}R` — riesgo eliminado ✅"
     )
-    await _send(text)
 
 
 async def notify_partial(
@@ -145,15 +80,14 @@ async def notify_partial(
     price: float, pnl_usdt: float,
 ) -> None:
     emoji = "✅" if pnl_usdt >= 0 else "❌"
-    text = (
-        f"✂️ *CIERRE PARCIAL* \\— `{_esc(symbol)}`\n"
-        f"┣ Cerrado 50% en breakeven\n"
-        f"┣ Precio: `{_fmt(price)}`\n"
-        f"┣ Qty cerrada:    `{_fmt(qty_closed)}`\n"
-        f"┣ Qty restante:   `{_fmt(qty_remaining)}`\n"
-        f"┗ PnL parcial: {emoji} `{_fmtu(pnl_usdt)} USDT`"
+    await _send(
+        f"✂️ *CIERRE PARCIAL* — {symbol}\n"
+        f"┣ Cerrado 50% a breakeven\n"
+        f"┣ Precio: `{price:.6f}`\n"
+        f"┣ Cantidad cerrada: `{qty_closed:.6f}`\n"
+        f"┣ Cantidad restante: `{qty_remaining:.6f}`\n"
+        f"┗ PnL parcial: {emoji} `{pnl_usdt:+.4f} USDT`"
     )
-    await _send(text)
 
 
 async def notify_exit(
@@ -161,7 +95,7 @@ async def notify_exit(
     entry: float, exit_price: float,
     qty: float, size_usdt: float, leverage: int,
     r_achieved: float, peak_r: float,
-    exit_reason: str,
+    exit_reason: str,   # "TRAIL" | "SL" | "TP" | "MANUAL"
 ) -> None:
     pnl_pct = ((exit_price - entry) / entry * 100) if side == "BUY" \
               else ((entry - exit_price) / entry * 100)
@@ -169,30 +103,27 @@ async def notify_exit(
 
     if exit_reason == "TP":
         header = "🎯 *TAKE PROFIT*"
-        result = "✅ GANANCIA"
+        result_emoji = "✅ GANANCIA"
     elif exit_reason == "SL":
         header = "🛑 *STOP LOSS*"
-        result = "❌ PERDIDA"
+        result_emoji = "❌ PÉRDIDA"
     elif exit_reason == "TRAIL":
-        header = "🏃 *SALIDA TRAILING*"
-        result = "✅ GANANCIA" if pnl_usdt >= 0 else "❌ PERDIDA"
+        header = "🎯 *SALIDA TRAILING*"
+        result_emoji = "✅ GANANCIA" if pnl_usdt >= 0 else "❌ PÉRDIDA"
     else:
-        header = "📤 *SALIDA MANUAL*"
-        result = "✅ GANANCIA" if pnl_usdt >= 0 else "❌ PERDIDA"
+        header = "📤 *SALIDA*"
+        result_emoji = "✅ GANANCIA" if pnl_usdt >= 0 else "❌ PÉRDIDA"
 
-    pnl_sign = "+" if pnl_usdt >= 0 else ""
-    text = (
-        f"{header} \\— `{_esc(symbol)}`\n"
-        f"┣ Resultado: *{_esc(result)}*\n"
-        f"┣ Dir: `{_esc(side)}`\n"
-        f"┣ Entrada:  `{_fmt(entry)}`\n"
-        f"┣ Salida:   `{_fmt(exit_price)}`\n"
-        f"┣ PnL: `{_esc(pnl_sign)}{_esc(f'{pnl_usdt:.4f}')} USDT` "
-        f"\\({_fmtp(pnl_pct)}%\\)\n"
-        f"┣ R logrado: `{_esc(f'{r_achieved:.2f}')}R` \\| Peak: `{_esc(f'{peak_r:.2f}')}R`\n"
-        f"┗ Razon: `{_esc(exit_reason)}`"
+    await _send(
+        f"{header} — {symbol}\n"
+        f"┣ Resultado: *{result_emoji}*\n"
+        f"┣ Dirección: `{side}`\n"
+        f"┣ Entrada: `{entry:.6f}`\n"
+        f"┣ Salida: `{exit_price:.6f}`\n"
+        f"┣ PnL: `{pnl_usdt:+.4f} USDT` ({pnl_pct:+.2f}%)\n"
+        f"┣ R alcanzado: `{r_achieved:.2f}R` | Peak R: `{peak_r:.2f}R`\n"
+        f"┗ Razón salida: `{exit_reason}`"
     )
-    await _send(text)
 
 
 async def notify_daily_summary(
@@ -201,12 +132,11 @@ async def notify_daily_summary(
 ) -> None:
     win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
     emoji = "📈" if net_pnl >= 0 else "📉"
-    pnl_sign = "+" if net_pnl >= 0 else ""
-    text = (
+    await _send(
         f"{emoji} *RESUMEN DIARIO*\n"
-        f"┣ Trades: `{total_trades}` \\| Win rate: `{_esc(f'{win_rate:.1f}')}%`\n"
-        f"┣ ✅ Ganados: `{wins}` \\| ❌ Perdidos: `{losses}`\n"
-        f"┣ PnL neto: `{_esc(pnl_sign)}{_esc(f'{net_pnl:.4f}')} USDT`\n"
-        f"┗ Balance: `{_esc(f'{balance:.2f}')} USDT`"
+        f"┣ Trades totales: `{total_trades}`\n"
+        f"┣ Ganados: `{wins}` ✅ | Perdidos: `{losses}` ❌\n"
+        f"┣ Win rate: `{win_rate:.1f}%`\n"
+        f"┣ PnL neto: `{net_pnl:+.4f} USDT`\n"
+        f"┗ Balance actual: `{balance:.2f} USDT`"
     )
-    await _send(text)

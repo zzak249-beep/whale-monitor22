@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
-"""client.py -- Three Step Bot v3 — BingX Async Client.
+"""client.py -- Three Step Bot v5 — BingX Async Client.
 
-ONE-WAY MODE. Improvements:
-  - Retry with backoff on timeouts
-  - get_price with ticker fallback
-  - set_leverage for both LONG and SHORT sides
-  - Detailed order failure logging
+Added in v5:
+  - fetch_funding_rate(symbol) — used by strategy to filter bad entries
+  - All previous fixes retained
 """
 from __future__ import annotations
 import asyncio
@@ -64,7 +62,6 @@ async def _request(method: str, path: str, params: dict | None = None,
     p = _auth_params(params) if auth else (params or {})
     headers = _headers() if auth else {}
     url = BASE_URL + path
-
     for attempt in range(retries):
         try:
             if method == "GET":
@@ -78,7 +75,7 @@ async def _request(method: str, path: str, params: dict | None = None,
                     return await r.json(content_type=None)
         except asyncio.TimeoutError:
             wait = 1.5 ** attempt
-            logger.warning(f"{method} {path} timeout #{attempt+1} — retry in {wait:.1f}s")
+            logger.warning(f"{method} {path} timeout #{attempt+1} — retry {wait:.1f}s")
             if attempt < retries - 1:
                 await asyncio.sleep(wait)
         except Exception as e:
@@ -123,6 +120,42 @@ async def fetch_ohlcv(symbol: str, tf: str, limit: int = 300) -> dict | None:
         return None
 
 
+async def fetch_funding_rate(symbol: str) -> float:
+    """Fetch current funding rate for symbol. Returns 0.0 on failure.
+    Positive = longs pay shorts. Negative = shorts pay longs."""
+    resp = await _get("/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
+    try:
+        data = resp.get("data", {})
+        if isinstance(data, list) and data:
+            data = data[0]
+        rate = float(data.get("lastFundingRate", data.get("fundingRate", 0)))
+        return rate
+    except Exception:
+        return 0.0
+
+
+async def fetch_all_funding_rates(symbols: list[str]) -> dict[str, float]:
+    """Batch fetch funding rates for all symbols."""
+    rates: dict[str, float] = {}
+    # Try batch endpoint first
+    resp = await _get("/openApi/swap/v2/quote/premiumIndex")
+    try:
+        data = resp.get("data", [])
+        if isinstance(data, list):
+            for item in data:
+                sym  = item.get("symbol", "")
+                rate = float(item.get("lastFundingRate", item.get("fundingRate", 0)))
+                rates[sym] = rate
+    except Exception:
+        pass
+
+    # Fallback: fetch missing symbols individually
+    missing = [s for s in symbols if s not in rates]
+    for sym in missing:
+        rates[sym] = await fetch_funding_rate(sym)
+    return rates
+
+
 # ── Account ───────────────────────────────────────────────────────────────────
 
 async def get_balance() -> float:
@@ -144,10 +177,8 @@ async def get_all_positions() -> dict[str, dict]:
     try:
         data = resp.get("data", [])
         if isinstance(data, list):
-            return {
-                p["symbol"]: p for p in data
-                if abs(float(p.get("positionAmt", 0))) > 1e-9
-            }
+            return {p["symbol"]: p for p in data
+                    if abs(float(p.get("positionAmt", 0))) > 1e-9}
     except Exception as e:
         logger.warning(f"get_positions error: {e}")
     return {}
@@ -175,22 +206,15 @@ async def place_market_order(symbol: str, side: str, size_usdt: float,
     resp = await _post("/openApi/swap/v2/trade/order", params)
     code = resp.get("code", -1)
     if code not in (0, 200, None):
-        logger.warning(
-            f"[ORDER FAIL] {symbol} {side} code={code} msg={resp.get('msg','')} "
-            f"sl={sl:.6f} tp={tp:.6f}"
-        )
+        logger.warning(f"[ORDER FAIL] {symbol} {side} code={code} msg={resp.get('msg','')} sl={sl} tp={tp}")
     return resp if isinstance(resp, dict) else {"raw": resp}
 
 
 async def place_reduce_order(symbol: str, side: str, quantity: float) -> dict:
-    params: dict[str, Any] = {
-        "symbol":     symbol,
-        "side":       side,
-        "type":       "MARKET",
-        "quantity":   quantity,
-        "reduceOnly": "true",
-    }
-    resp = await _post("/openApi/swap/v2/trade/order", params)
+    resp = await _post("/openApi/swap/v2/trade/order", {
+        "symbol": symbol, "side": side, "type": "MARKET",
+        "quantity": quantity, "reduceOnly": "true",
+    })
     return resp if isinstance(resp, dict) else {}
 
 
@@ -220,7 +244,6 @@ async def get_price(symbol: str) -> float:
             return price
     except Exception:
         pass
-    # Fallback: ticker endpoint
     resp2 = await _get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
     try:
         data2 = resp2.get("data", {})

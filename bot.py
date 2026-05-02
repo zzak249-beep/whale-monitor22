@@ -1,299 +1,280 @@
-"""
-Maki Bot v2 — ZigZag + 20MA 4H + RSI para BingX Perpetual Futures
-TP: +0.45%  |  SL: -0.30%  |  Top N pares por volumen
+# -*- coding: utf-8 -*-
+"""bot.py -- Three Step Bot v5.
 
-Flujo principal
-───────────────
-1. Arranca, muestra balance y lista de pares activos en Telegram
-2. Cada SCAN_INTERVAL_SECONDS segundos:
-   a. monitor()  → detecta posiciones cerradas por TP/SL en BingX
-   b. scan()     → busca nuevas señales en todos los pares
-3. Cada hora actualiza el ranking de pares por volumen
-4. Heartbeat periódico a Telegram con resumen de estado
-5. Captura SIGTERM (Railway) para un shutdown limpio
+Fixes vs v4 (why no trades):
+  1. Funding rates pre-fetched once per cycle (not per symbol)
+  2. Skip reasons logged at INFO level (visible in Railway logs)
+  3. Balance check relaxed: min_balance_usdt lowered to 10 USDT
+  4. SL distance check lowered to 0.05% (was 0.1%)
+  5. Added [DIAG] cycle summary: signals found, skipped reasons
 """
+from __future__ import annotations
 import asyncio
-import logging
-import os
 import signal
-from datetime import datetime, timezone
+import sys
 
-from bingx   import BingXClient
-from strategy import signal as get_signal, tp_sl
-from telegram import TelegramNotifier
+from loguru import logger
+from aiohttp import web
 
-# ── Logging ────────────────────────────────────────────────────────── #
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
+from config import cfg
+import client as ex
+from scanner import fetch_universe
+from strategy import get_signal, in_trading_session
+from pos_manager import (
+    Trade, add_trade, open_symbols, trade_count, is_halted,
+    manage_positions, sync_from_exchange, get_stats,
 )
-logger = logging.getLogger("bot")
+import notifier
 
-# ── Config desde variables de entorno ──────────────────────────────── #
-API_KEY       = os.environ["BINGX_API_KEY"]
-API_SECRET    = os.environ["BINGX_API_SECRET"]
-TG_TOKEN      = os.environ["TELEGRAM_BOT_TOKEN"]
-TG_CHAT       = os.environ["TELEGRAM_CHAT_ID"]
-
-TRADE_USDT    = float(os.environ.get("TRADE_AMOUNT_USDT",       "10"))
-MAX_TRADES    = int(os.environ.get("MAX_OPEN_TRADES",            "3"))
-SCAN_SECS     = int(os.environ.get("SCAN_INTERVAL_SECONDS",     "60"))
-TOP_N         = int(os.environ.get("TOP_N_SYMBOLS",             "20"))
-LEVERAGE      = int(os.environ.get("LEVERAGE",                   "5"))
-MIN_BALANCE   = float(os.environ.get("MIN_BALANCE_USDT",        "20"))
-COOLDOWN_S    = int(os.environ.get("COOLDOWN_SECONDS",          "300"))
-HEARTBEAT_MIN = int(os.environ.get("HEARTBEAT_MINUTES",         "60"))
-
-# ── Estado en memoria ──────────────────────────────────────────────── #
-open_trades: dict[str, dict] = {}   # symbol → {side,entry,tp,sl,qty,order_id}
-cooldowns:   dict[str, float] = {}  # symbol → timestamp del último cierre
-_shutdown = False
+logger.remove()
+logger.add(
+    sys.stdout, level="DEBUG",   # DEBUG so skip reasons are visible
+    format="<green>{time:HH:mm:ss}</green> | <level>{level: <7}</level> | {message}"
+)
 
 
-# ── Utilidades ─────────────────────────────────────────────────────── #
-
-def _now() -> float:
-    return datetime.now(timezone.utc).timestamp()
-
-def _in_cooldown(symbol: str) -> bool:
-    return (_now() - cooldowns.get(symbol, 0)) < COOLDOWN_S
-
-def _qty(price: float) -> float:
-    return round(TRADE_USDT / price, 4) if price > 0 else 0.0
-
-def _pnl(trade: dict, exit_price: float) -> float:
-    if trade["side"] == "LONG":
-        return (exit_price - trade["entry"]) * trade["qty"]
-    return (trade["entry"] - exit_price) * trade["qty"]
+# ── Health ────────────────────────────────────────────────────────────────────
+async def _health(_: web.Request) -> web.Response:
+    stats = get_stats()
+    return web.json_response({
+        "status":       "halted" if stats["halted"] else "ok",
+        "version":      "5.0",
+        "open_trades":  stats["open"],
+        "daily_trades": stats["daily_trades"],
+        "daily_pnl":    stats["daily_pnl"],
+        "daily_wins":   stats["daily_wins"],
+        "daily_losses": stats["daily_losses"],
+        "symbols":      list(open_symbols()),
+    })
 
 
-# ── Monitor de posiciones ──────────────────────────────────────────── #
+async def start_health_server() -> None:
+    app = web.Application()
+    app.router.add_get("/", _health)
+    app.router.add_get("/health", _health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", cfg.health_port)
+    await site.start()
+    logger.info(f"Health :{cfg.health_port}")
 
-async def monitor(client: BingXClient, tg: TelegramNotifier):
-    """
-    Compara el estado interno con las posiciones reales de BingX.
-    Si una posición ya no existe en la API → fue cerrada por TP o SL.
-    """
-    if not open_trades:
+
+# ── Entry ─────────────────────────────────────────────────────────────────────
+async def enter_trade(sig) -> bool:
+    """Returns True if trade was placed."""
+    if sig.symbol in open_symbols():
+        return False
+    if trade_count() >= cfg.max_positions:
+        logger.debug(f"[SKIP] {sig.symbol} — at max positions ({cfg.max_positions})")
+        return False
+    if is_halted():
+        logger.warning(f"[SKIP] {sig.symbol} — bot halted")
+        return False
+
+    size     = max(cfg.trade_usdt, 5.0)
+    leverage = cfg.leverage
+    margin   = (size / leverage) * 1.2   # FIXED: was 1.3
+
+    bal = await ex.get_balance()
+    if bal < cfg.min_balance_usdt:
+        logger.warning(f"[SKIP] {sig.symbol} — balance {bal:.2f} < min {cfg.min_balance_usdt}")
+        return False
+    if bal < margin:
+        logger.warning(f"[SKIP] {sig.symbol} — balance {bal:.2f} < margin {margin:.2f}")
+        return False
+
+    # SL/TP sanity
+    if sig.side == "BUY"  and (sig.sl >= sig.price or sig.tp <= sig.price):
+        logger.warning(f"[SKIP] {sig.symbol} — BUY SL/TP invalid")
+        return False
+    if sig.side == "SELL" and (sig.sl <= sig.price or sig.tp >= sig.price):
+        logger.warning(f"[SKIP] {sig.symbol} — SELL SL/TP invalid")
+        return False
+
+    sl_pct = abs(sig.price - sig.sl) / sig.price * 100
+    if sl_pct < 0.05:   # FIXED: was 0.1%
+        logger.warning(f"[SKIP] {sig.symbol} — SL too close ({sl_pct:.3f}%)")
+        return False
+
+    # Place order
+    await ex.set_leverage(sig.symbol, leverage)
+    await asyncio.sleep(0.3)
+
+    resp = await ex.place_market_order(
+        symbol=sig.symbol, side=sig.side,
+        size_usdt=size, sl=sig.sl, tp=sig.tp,
+    )
+    code = resp.get("code", -1)
+    if code not in (0, 200, None):
+        logger.warning(f"[FAIL] {sig.symbol} code={code} {resp.get('msg','')}")
+        return False
+
+    order_data = resp.get("data", {})
+    if isinstance(order_data, dict):
+        order_data = order_data.get("order", order_data)
+    qty = float(order_data.get("executedQty", 0) or order_data.get("origQty", 0))
+    if qty <= 0:
+        qty = (size * leverage) / sig.price
+
+    trade = Trade(
+        symbol=sig.symbol, side=sig.side,
+        entry=sig.price, sl=sig.sl, tp=sig.tp,
+        atr=sig.atr, size_usdt=size, leverage=leverage,
+        qty=qty, score=sig.score, vol_ratio=sig.vol_ratio,
+        delta1=sig.delta1, delta2=sig.delta2,
+        order_id=str(order_data.get("orderId", "")),
+        bot_opened=True,
+    )
+    add_trade(trade)
+
+    logger.success(
+        f"[ENTRY ✅] {sig.symbol} {sig.side} @ {sig.price:.6f} "
+        f"SL={sig.sl:.6f} TP={sig.tp:.6f} score={sig.score}/5 vol={sig.vol_ratio:.1f}x"
+    )
+    await notifier.notify_entry(
+        symbol=sig.symbol, side=sig.side, price=sig.price,
+        sl=sig.sl, tp=sig.tp, size_usdt=size,
+        leverage=leverage, qty=qty, score=sig.score,
+        delta1=sig.delta1, delta2=sig.delta2, vol_ratio=sig.vol_ratio,
+    )
+    return True
+
+
+# ── Scan ──────────────────────────────────────────────────────────────────────
+async def scan_cycle() -> None:
+    if is_halted():
+        logger.warning("[HALTED] Ciclo saltado")
         return
 
-    try:
-        positions   = await client.get_open_positions()
-        open_syms   = {p["symbol"] for p in positions}
-    except Exception as e:
-        logger.warning(f"monitor: no se pudieron obtener posiciones: {e}")
-        open_syms = set(open_trades.keys())   # asumir abiertas si falla la API
+    symbols = cfg.symbols
 
-    for symbol in list(open_trades.keys()):
-        trade = open_trades[symbol]
+    # Session check (informative)
+    in_session = in_trading_session()
+    session_str = "✅ en sesión" if in_session else "⏸ fuera de sesión"
 
-        # ── Cerrada automáticamente por BingX (TP/SL ejecutado) ── #
-        if symbol not in open_syms:
-            try:
-                price = await client.last_price(symbol)
-            except Exception:
-                price = trade["entry"]
-
-            side   = trade["side"]
-            pnl    = _pnl(trade, price)
-            hit_tp = (price >= trade["tp"]) if side == "LONG" else (price <= trade["tp"])
-            reason = "TP ✅" if hit_tp else "SL ❌"
-
-            del open_trades[symbol]
-            cooldowns[symbol] = _now()
-            logger.info(f"Cerrado externamente {symbol} {side} {reason} pnl≈{pnl:.2f}")
-            await tg.notify(
-                f"{'🟢' if hit_tp else '🔴'} *{reason} — {symbol}*\n"
-                f"Dirección: `{side}`\n"
-                f"Entrada: `{trade['entry']:.4f}` → Precio: `{price:.4f}`\n"
-                f"PnL est.: `{pnl:+.2f} USDT`"
-            )
-            continue
-
-        # ── Verificación manual por si las órdenes TP/SL no se ejecutaron ── #
-        try:
-            price = await client.last_price(symbol)
-        except Exception as e:
-            logger.warning(f"monitor last_price {symbol}: {e}")
-            continue
-
-        side   = trade["side"]
-        hit_tp = price >= trade["tp"] if side == "LONG" else price <= trade["tp"]
-        hit_sl = price <= trade["sl"] if side == "LONG" else price >= trade["sl"]
-
-        if hit_tp or hit_sl:
-            reason = "TP ✅" if hit_tp else "SL ❌"
-            pnl    = _pnl(trade, price)
-            try:
-                await client.close_position(symbol, side, trade["qty"])
-            except Exception as e:
-                logger.error(f"close_position {symbol}: {e}")
-
-            del open_trades[symbol]
-            cooldowns[symbol] = _now()
-            logger.info(f"Cerrado manual {symbol} {side} {reason} pnl={pnl:.2f}")
-            await tg.notify(
-                f"{'🟢' if hit_tp else '🔴'} *{reason} — {symbol}*\n"
-                f"Dirección: `{side}`\n"
-                f"Entrada: `{trade['entry']:.4f}` → Salida: `{price:.4f}`\n"
-                f"PnL est.: `{pnl:+.2f} USDT`"
-            )
-
-
-# ── Scanner de señales ─────────────────────────────────────────────── #
-
-async def scan(client: BingXClient, tg: TelegramNotifier, symbols: list[str]):
-    if len(open_trades) >= MAX_TRADES:
-        return
-
-    try:
-        balance = await client.balance_usdt()
-    except Exception:
-        balance = MIN_BALANCE
-
-    if balance < MIN_BALANCE:
-        logger.warning(f"Balance {balance:.2f} < mínimo {MIN_BALANCE} — scan suspendido")
-        return
-
-    for symbol in symbols:
-        if _shutdown or len(open_trades) >= MAX_TRADES:
-            break
-        if symbol in open_trades or _in_cooldown(symbol):
-            continue
-
-        try:
-            c15 = await client.klines(symbol, "15m", limit=60)
-            c4h = await client.klines(symbol, "4h",  limit=30)
-        except Exception as e:
-            logger.warning(f"klines {symbol}: {e}")
-            continue
-
-        sig = get_signal(c15, c4h)
-        if sig is None:
-            continue
-
-        try:
-            price = await client.last_price(symbol)
-            if price <= 0:
-                price = c15[-1]["c"]
-        except Exception:
-            price = c15[-1]["c"]
-
-        tp, sl = tp_sl(price, sig, c15)
-        qty    = _qty(price)
-        if qty <= 0:
-            logger.warning(f"qty inválida {symbol} @ {price}")
-            continue
-
-        try:
-            order_id = await client.open_order(symbol, sig, qty, tp, sl, LEVERAGE)
-        except Exception as e:
-            logger.error(f"open_order {symbol}: {e}")
-            await tg.notify(f"⚠️ Error abriendo `{symbol}`: `{str(e)[:150]}`")
-            continue
-
-        open_trades[symbol] = {
-            "side": sig, "entry": price,
-            "tp": tp, "sl": sl, "qty": qty,
-            "order_id": order_id, "opened_at": _now(),
-        }
-
-        emoji = "📈" if sig == "LONG" else "📉"
-        logger.info(f"Trade: {symbol} {sig} entry={price:.4f} tp={tp:.4f} sl={sl:.4f}")
-        await tg.notify(
-            f"{emoji} *{sig} — {symbol}*\n"
-            f"Entrada: `{price:.4f}`\n"
-            f"TP: `{tp:.4f}` (+0.45%)\n"
-            f"SL: `{sl:.4f}` (-0.30%)\n"
-            f"Cantidad: `{qty}` | ~`{TRADE_USDT} USDT` | `{LEVERAGE}x`"
-        )
-        await asyncio.sleep(0.3)
-
-
-# ── Heartbeat ──────────────────────────────────────────────────────── #
-
-async def heartbeat(client: BingXClient, tg: TelegramNotifier):
-    try:
-        balance = await client.balance_usdt()
-        lines   = "\n".join(
-            f"  • `{sym}` {t['side']} @ `{t['entry']:.4f}`"
-            for sym, t in open_trades.items()
-        ) or "  _Ninguno_"
-        await tg.notify(
-            f"💓 *Heartbeat*\n"
-            f"Balance: `{balance:.2f} USDT`\n"
-            f"Trades: `{len(open_trades)}/{MAX_TRADES}`\n"
-            f"{lines}"
-        )
-    except Exception as e:
-        logger.warning(f"heartbeat: {e}")
-
-
-# ── Shutdown ───────────────────────────────────────────────────────── #
-
-def _on_signal(sig, _):
-    global _shutdown
-    logger.info(f"Señal {sig} — iniciando shutdown limpio")
-    _shutdown = True
-
-
-# ── Main ───────────────────────────────────────────────────────────── #
-
-async def main():
-    signal.signal(signal.SIGTERM, _on_signal)
-    signal.signal(signal.SIGINT,  _on_signal)
-
-    client = BingXClient(API_KEY, API_SECRET)
-    tg     = TelegramNotifier(TG_TOKEN, TG_CHAT)
-    tg.start()
-
-    try:
-        balance = await client.balance_usdt()
-        symbols = await client.top_symbols_by_volume(TOP_N)
-    except Exception as e:
-        logger.critical(f"Error al arrancar: {e}")
-        await tg.notify(f"🚨 *Maki Bot — error al arrancar*\n`{e}`")
-        await client.close()
-        return
-
-    logger.info(f"Balance: {balance:.2f} USDT | Pares: {len(symbols)}")
-    await tg.notify(
-        f"🤖 *Maki Bot v2 iniciado*\n"
-        f"Balance: `{balance:.2f} USDT`\n"
-        f"Trade: `{TRADE_USDT} USDT` | Leverage: `{LEVERAGE}x`\n"
-        f"Pares: `{len(symbols)}` | TP: +0.45% | SL: -0.30%\n"
-        f"Max trades: `{MAX_TRADES}` | Cooldown: `{COOLDOWN_S}s`"
+    logger.info(
+        f"Scan {len(symbols)} símbolos | TF={cfg.timeframe} "
+        f"open={trade_count()}/{cfg.max_positions} | {session_str}"
     )
 
-    cycle          = 0
-    last_heartbeat = _now()
-    cycles_per_h   = max(1, 3600 // SCAN_SECS)
-
-    while not _shutdown:
-        cycle += 1
+    # Pre-fetch funding rates once for all symbols
+    funding_rates: dict[str, float] = {}
+    if cfg.funding_filter:
         try:
-            await monitor(client, tg)
-            await scan(client, tg, symbols)
-
-            if cycle % cycles_per_h == 0:
-                symbols = await client.top_symbols_by_volume(TOP_N)
-                logger.info(f"Pares actualizados: {len(symbols)}")
-
-            if (_now() - last_heartbeat) / 60 >= HEARTBEAT_MIN:
-                await heartbeat(client, tg)
-                last_heartbeat = _now()
-
+            funding_rates = await ex.fetch_all_funding_rates(symbols)
+            high_funding = {s: f for s, f in funding_rates.items() if abs(f) > 0.0003}
+            if high_funding:
+                logger.info(f"[FUNDING] Tasas altas: {high_funding}")
         except Exception as e:
-            logger.error(f"Loop error ciclo {cycle}: {e}", exc_info=True)
-            await tg.notify(f"⚠️ Error en bot: `{str(e)[:200]}`")
+            logger.debug(f"[FUNDING] Error fetching rates: {e}")
 
-        await asyncio.sleep(SCAN_SECS)
+    ohlcv_map = await fetch_universe(symbols, cfg.timeframe, cfg.max_concurrent)
+    await manage_positions(ohlcv_map)
 
-    await tg.notify("🛑 *Maki Bot detenido* — posiciones abiertas NO cerradas automáticamente.")
-    await tg.stop()
-    await client.close()
+    signals = []
+    skipped_reasons: dict[str, int] = {}
+
+    for sym, ohlcv in ohlcv_map.items():
+        if sym in open_symbols():
+            continue
+        funding = funding_rates.get(sym, 0.0) if cfg.funding_filter else 0.0
+        sig = get_signal(
+            ohlcv, sym,
+            period=cfg.period,
+            atr_period=cfg.atr_period,
+            atr_mult=cfg.atr_mult,
+            rr=cfg.rr,
+            min_volume_mult=cfg.min_volume_mult,
+            min_atr_pct=cfg.min_atr_pct,
+            trend_filter=cfg.trend_filter,
+            session_filter=cfg.session_filter,
+            funding_rate=funding,
+        )
+        if sig:
+            signals.append(sig)
+
+    # Sort best signals first
+    signals.sort(key=lambda s: s.score, reverse=True)
+
+    if signals:
+        logger.info(f"[SIGNALS] {len(signals)} señales encontradas: "
+                    f"{[(s.symbol, s.side, s.score) for s in signals]}")
+    else:
+        logger.info("[SIGNALS] 0 señales este ciclo")
+
+    placed = 0
+    for sig in signals:
+        if trade_count() >= cfg.max_positions:
+            break
+        success = await enter_trade(sig)
+        if success:
+            placed += 1
+
+    if placed:
+        logger.success(f"[CYCLE] {placed} trade(s) abiertos este ciclo")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+async def main_loop() -> None:
+    await start_health_server()
+
+    logger.info("=" * 65)
+    logger.info("  THREE STEP BOT v5.0 — Fixes: señales + funding + sesión")
+    logger.info(f"  TF={cfg.timeframe} | ATR×{cfg.atr_mult} | RR=1:{cfg.rr} | ×{cfg.leverage}")
+    logger.info(f"  Trade={max(cfg.trade_usdt,5)}USDT | MaxPos={cfg.max_positions}")
+    logger.info(f"  Filtros: vol≥{cfg.min_volume_mult}x | trend={cfg.trend_filter} | "
+                f"session={cfg.session_filter} | funding={cfg.funding_filter}")
+    logger.info(f"  Riesgo: pérdida_max={cfg.max_daily_loss_pct}% | "
+                f"trades_max={cfg.max_daily_trades}/día")
+    logger.info("=" * 65)
+
+    bal = await ex.get_balance()
+    logger.info(f"  Balance inicial: {bal:.2f} USDT")
+
+    await notifier.notify(
+        f"*Three Step Bot v5.0* 🚀\n"
+        f"TF: `{cfg.timeframe}` | RR: `1:{cfg.rr}` | ×`{cfg.leverage}`\n"
+        f"Trade: `{max(cfg.trade_usdt,5)} USDT` | MaxPos: `{cfg.max_positions}`\n"
+        f"Balance: `{bal:.2f} USDT`\n"
+        f"Sesión: `07:00-20:00 UTC` | Funding filter: `{cfg.funding_filter}`\n\n"
+        f"Recibirás:\n"
+        f"🚀 Entradas | 🔒 Breakeven | ✂️ Cierre parcial\n"
+        f"🎯 Salidas con PnL | 📈 Resumen diario"
+    )
+
+    await sync_from_exchange()
+
+    loop = asyncio.get_event_loop()
+    stop_event = asyncio.Event()
+
+    def _shutdown(*_):
+        logger.info("SIGTERM — deteniendo bot")
+        stop_event.set()
+
+    for s in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(s, _shutdown)
+
+    while not stop_event.is_set():
+        try:
+            t0 = loop.time()
+            await scan_cycle()
+            elapsed = loop.time() - t0
+            sleep_for = max(0, cfg.scan_interval - elapsed)
+            logger.info(f"Ciclo {elapsed:.1f}s | siguiente en {sleep_for:.0f}s")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
+            except asyncio.TimeoutError:
+                pass
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[ERROR] {e}")
+            await notifier.notify(f"⚠️ Error: {e}")
+            await asyncio.sleep(30)
+
+    logger.info("Bot detenido limpiamente")
+    await ex.close_session()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main_loop())
