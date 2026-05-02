@@ -1,2 +1,6 @@
 aiohttp==3.9.5
 loguru
+numpy
+pandas
+requests
+python-dotenv
