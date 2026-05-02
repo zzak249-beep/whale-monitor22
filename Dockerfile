@@ -1,22 +1,15 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
-# System deps
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
+# Dependencias primero (capa cacheada)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Código fuente
+COPY src/ ./src/
 
-RUN mkdir -p data
+# Sin EXPOSE — este contenedor no sirve HTTP
+# Railway detectará automáticamente que es un worker
 
-# Railway injects PORT automatically
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONPATH=/app
-
-CMD ["python", "bot.py"]
+CMD ["python", "-u", "src/bot.py"]

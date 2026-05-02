@@ -1,205 +1,161 @@
-# -*- coding: utf-8 -*-
-"""strategy.py -- Three Step Bot v3 — Professional Signal Engine.
-
-Improvements over v1/v2:
-  1. EMA50 trend filter — only LONG when price > EMA50, SHORT when below
-  2. Volume spike filter — bar volume >= min_volume_mult * 20-bar avg
-  3. ATR minimum filter — avoids flat/ranging markets
-  4. Delta2 proportional filter — d2 must be meaningful vs d1
-  5. Fixed d3_curr bug (was `_`)
-  6. Confluence score — stronger signals get priority
-  7. Anti-chop: requires d1 magnitude > 0 for at least 2 bars
 """
-from __future__ import annotations
+Estrategia Maki — ZigZag (pivotes) + 20MA en 4H + RSI en 15m
+TP: +0.45% | SL: -0.30%
 
-import numpy as np
-from dataclasses import dataclass
+Lógica de la estrategia
+────────────────────────
+1. TENDENCIA (filtro 4H)
+   Calculamos la SMA-20 sobre las últimas 30 velas de 4H.
+   - Si la MA está subiendo  → solo buscamos LONGs
+   - Si la MA está bajando   → solo buscamos SHORTs
+   - Si está plana           → sin operación
 
+2. ENTRADA (señal 15m — ZigZag)
+   Detectamos el último pico (pivot high) y el último valle (pivot low)
+   usando N velas a cada lado para confirmar el extremo.
+   - LONG:  el cierre anterior estaba ≤ pico y el cierre actual lo supera
+             (ruptura del pico al alza) + tendencia alcista + RSI no sobrecomprado
+   - SHORT: el cierre anterior estaba ≥ valle y el cierre actual lo rompe
+             (ruptura del valle a la baja) + tendencia bajista + RSI no sobrevendido
 
-@dataclass
-class Signal:
-    symbol:     str
-    side:       str    # "BUY" | "SELL"
-    price:      float
-    sl:         float
-    tp:         float
-    atr:        float
-    delta1:     float
-    delta2:     float
-    delta3:     float
-    score:      int    # confluence score 1-5 (higher = stronger signal)
-    vol_ratio:  float  # bar_vol / avg_vol
+3. RSI (filtro de sobreextensión)
+   RSI-14 sobre el 15m. Evita entrar en movimientos ya agotados:
+   - No LONG si RSI > 65 (mercado sobrecomprado)
+   - No SHORT si RSI < 35 (mercado sobrevendido)
 
+4. TP/SL
+   Porcentaje fijo respecto al precio de entrada:
+   - TP: +0.45%  |  SL: -0.30%  (ratio R:R ≈ 1.5)
+"""
+from typing import Optional
+import logging
 
-# ── Indicators ────────────────────────────────────────────────────────────────
+logger = logging.getLogger("strategy")
 
-def _rolling_sum(arr: np.ndarray, n: int) -> np.ndarray:
-    cs = np.cumsum(arr)
-    out = cs.copy()
-    out[n:] = cs[n:] - cs[:-n]
-    out[:n] = cs[:n]
-    return out
-
-
-def _ema(arr: np.ndarray, period: int) -> np.ndarray:
-    out = np.zeros_like(arr)
-    k = 2.0 / (period + 1)
-    out[0] = arr[0]
-    for i in range(1, len(arr)):
-        out[i] = arr[i] * k + out[i - 1] * (1 - k)
-    return out
-
-
-def _atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int) -> np.ndarray:
-    prev_close = np.roll(closes, 1)
-    prev_close[0] = closes[0]
-    tr = np.maximum(highs - lows,
-         np.maximum(np.abs(highs - prev_close),
-                    np.abs(lows  - prev_close)))
-    atr_arr = np.zeros_like(tr)
-    atr_arr[period - 1] = tr[:period].mean()
-    for i in range(period, len(tr)):
-        atr_arr[i] = (atr_arr[i - 1] * (period - 1) + tr[i]) / period
-    return atr_arr
+# ── Parámetros ─────────────────────────────────────────────────────── #
+TP_PCT      = 0.0045   # Take Profit 0.45%
+SL_PCT      = 0.0030   # Stop Loss   0.30%
+PIVOT_BARS  = 5        # velas a cada lado para confirmar pico/valle
+RSI_PERIOD  = 14
+RSI_OB      = 65       # RSI sobrecompra — no abrir LONG por encima
+RSI_OS      = 35       # RSI sobreventa  — no abrir SHORT por debajo
 
 
-def compute_deltas(
-    opens: np.ndarray, closes: np.ndarray, volumes: np.ndarray, period: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    delta_vol = np.where(closes > opens, volumes, -volumes)
-    d_full1 = _rolling_sum(delta_vol, period)
-    d_full2 = _rolling_sum(delta_vol, period * 2)
-    d_full3 = _rolling_sum(delta_vol, period * 3)
-    delta1 = d_full1
-    delta2 = d_full2 - delta1
-    delta3 = d_full3 - delta1 - delta2
-    return delta1, delta2, delta3
+# ── Indicadores ────────────────────────────────────────────────────── #
+
+def _sma(values: list[float], period: int) -> list[Optional[float]]:
+    result = []
+    for i in range(len(values)):
+        if i < period - 1:
+            result.append(None)
+        else:
+            result.append(sum(values[i - period + 1 : i + 1]) / period)
+    return result
 
 
-# ── Main signal function ──────────────────────────────────────────────────────
+def _rsi(closes: list[float], period: int = RSI_PERIOD) -> Optional[float]:
+    """RSI de Wilder. Retorna el valor más reciente o None si no hay datos."""
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+    avg_g = sum(gains[:period]) / period
+    avg_l = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * (period - 1) + gains[i]) / period
+        avg_l = (avg_l * (period - 1) + losses[i]) / period
+    if avg_l == 0:
+        return 100.0
+    return 100 - (100 / (1 + avg_g / avg_l))
 
-def get_signal(
-    ohlcv:          dict,
-    symbol:         str,
-    period:         int   = 20,
-    atr_period:     int   = 14,
-    atr_mult:       float = 1.5,
-    rr:             float = 3.0,
-    min_volume_mult: float = 0.8,
-    min_atr_pct:    float = 0.3,
-    trend_filter:   bool  = True,
-    d2_min_ratio:   float = 0.1,
-) -> Signal | None:
 
-    opens   = ohlcv["open"]
-    highs   = ohlcv["high"]
-    lows    = ohlcv["low"]
-    closes  = ohlcv["close"]
-    volumes = ohlcv["volume"]
+# ── Detección de pivotes ────────────────────────────────────────────── #
 
-    min_bars = period * 3 + atr_period + 55
-    if len(closes) < min_bars:
+def _last_pivot_high(highs: list[float]) -> Optional[float]:
+    n = len(highs)
+    for i in range(n - PIVOT_BARS - 1, PIVOT_BARS - 1, -1):
+        h = highs[i]
+        if (all(h > highs[i - j] for j in range(1, PIVOT_BARS + 1)) and
+                all(h > highs[i + j] for j in range(1, PIVOT_BARS + 1))):
+            return h
+    return None
+
+
+def _last_pivot_low(lows: list[float]) -> Optional[float]:
+    n = len(lows)
+    for i in range(n - PIVOT_BARS - 1, PIVOT_BARS - 1, -1):
+        l = lows[i]
+        if (all(l < lows[i - j] for j in range(1, PIVOT_BARS + 1)) and
+                all(l < lows[i + j] for j in range(1, PIVOT_BARS + 1))):
+            return l
+    return None
+
+
+# ── Señal principal ────────────────────────────────────────────────── #
+
+def signal(candles_15m: list[dict], candles_4h: list[dict]) -> Optional[str]:
+    """
+    Retorna "LONG", "SHORT" o None.
+    Las listas deben estar en orden cronológico (más antigua primero).
+    Cada vela es un dict {o, h, l, c, v}.
+    """
+    MIN_15M = PIVOT_BARS * 2 + RSI_PERIOD + 5
+    if len(candles_15m) < MIN_15M:
+        logger.debug(f"15m insuficiente ({len(candles_15m)}<{MIN_15M})")
+        return None
+    if len(candles_4h) < 22:
+        logger.debug(f"4H insuficiente ({len(candles_4h)})")
         return None
 
-    delta1, delta2, delta3 = compute_deltas(opens, closes, volumes, period)
-    atr_arr = _atr(highs, lows, closes, atr_period)
-    ema50   = _ema(closes, 50)
-
-    # Signal bar = last closed candle (-2), previous = -3
-    d1_prev  = delta1[-3]
-    d1_curr  = delta1[-2]
-    d2_curr  = delta2[-2]
-    d3_curr  = delta3[-2]
-    atr_val  = atr_arr[-2]
-    price    = closes[-2]
-    ema_val  = ema50[-2]
-
-    if atr_val <= 0 or price <= 0:
+    # 1. Filtro de tendencia 4H ── MA-20
+    closes_4h = [c["c"] for c in candles_4h]
+    ma20      = [v for v in _sma(closes_4h, 20) if v is not None]
+    if len(ma20) < 2:
+        return None
+    ma_up   = ma20[-1] > ma20[-2]
+    ma_down = ma20[-1] < ma20[-2]
+    if not ma_up and not ma_down:
+        logger.debug("MA20 4H plana")
         return None
 
-    # ── Filter 1: ATR minimum (avoid flat markets) ────────────────────────
-    atr_pct = (atr_val / price) * 100
-    if atr_pct < min_atr_pct:
+    # 2. RSI 15m
+    closes_15m = [c["c"] for c in candles_15m]
+    rsi = _rsi(closes_15m)
+    if rsi is None:
         return None
 
-    # ── Filter 2: Volume spike ────────────────────────────────────────────
-    avg_vol  = float(np.mean(volumes[-22:-2]))
-    bar_vol  = float(volumes[-2])
-    vol_ratio = (bar_vol / avg_vol) if avg_vol > 0 else 0
-    if vol_ratio < min_volume_mult:
+    # 3. Pivotes 15m
+    highs  = [c["h"] for c in candles_15m]
+    lows   = [c["l"] for c in candles_15m]
+    peak   = _last_pivot_high(highs)
+    valley = _last_pivot_low(lows)
+    if peak is None or valley is None:
+        logger.debug("Sin pivote reciente en 15m")
         return None
 
-    # ── Filter 3: Delta crossover check ───────────────────────────────────
-    long_cross  = d1_prev <= 0 < d1_curr
-    short_cross = d1_prev >= 0 > d1_curr
+    prev_c = candles_15m[-2]["c"]
+    last_c = candles_15m[-1]["c"]
 
-    if not long_cross and not short_cross:
-        return None
+    # 4. Condiciones de entrada
+    if prev_c <= peak < last_c and ma_up and rsi < RSI_OB:
+        logger.info(f"LONG | peak={peak:.4f} MA↑ RSI={rsi:.1f}")
+        return "LONG"
 
-    # ── Filter 4: Delta2 confirmation (meaningful, not noise) ────────────
-    if abs(d1_curr) > 0:
-        d2_ratio = abs(d2_curr) / abs(d1_curr)
-    else:
-        return None
-
-    if long_cross  and (d2_curr <= 0 or d2_ratio < d2_min_ratio):
-        return None
-    if short_cross and (d2_curr >= 0 or d2_ratio < d2_min_ratio):
-        return None
-
-    # ── Filter 5: EMA50 trend alignment ──────────────────────────────────
-    if trend_filter:
-        if long_cross  and price < ema_val:
-            return None
-        if short_cross and price > ema_val:
-            return None
-
-    # ── Confluence score (1-5) ────────────────────────────────────────────
-    score = 1
-    if vol_ratio >= 1.5:          score += 1  # strong volume
-    if d2_ratio >= 0.5:           score += 1  # delta2 strong vs delta1
-    if abs(d3_curr) < abs(d2_curr): score += 1  # delta3 weaker = trend fresh
-    if atr_pct >= 0.6:            score += 1  # good volatility
-
-    # Only take score >= 2 signals
-    if score < 2:
-        return None
-
-    sl_dist = atr_val * atr_mult
-    tp_dist = sl_dist * rr
-
-    if long_cross:
-        return Signal(
-            symbol=symbol, side="BUY", price=price,
-            sl=round(price - sl_dist, 8),
-            tp=round(price + tp_dist, 8),
-            atr=atr_val, delta1=d1_curr, delta2=d2_curr, delta3=d3_curr,
-            score=score, vol_ratio=round(vol_ratio, 2),
-        )
-
-    if short_cross:
-        return Signal(
-            symbol=symbol, side="SELL", price=price,
-            sl=round(price + sl_dist, 8),
-            tp=round(price - tp_dist, 8),
-            atr=atr_val, delta1=d1_curr, delta2=d2_curr, delta3=d3_curr,
-            score=score, vol_ratio=round(vol_ratio, 2),
-        )
+    if prev_c >= valley > last_c and ma_down and rsi > RSI_OS:
+        logger.info(f"SHORT | valley={valley:.4f} MA↓ RSI={rsi:.1f}")
+        return "SHORT"
 
     return None
 
 
-def delta1_flipped(ohlcv: dict, period: int, trade_side: str) -> bool:
-    """True when delta1 flipped against the open trade — trailing exit signal."""
-    opens   = ohlcv["open"]
-    closes  = ohlcv["close"]
-    volumes = ohlcv["volume"]
-    if len(closes) < period * 3 + 5:
-        return False
-    delta1, _, _ = compute_deltas(opens, closes, volumes, period)
-    curr = delta1[-2]
-    if trade_side == "BUY"  and curr < 0:
-        return True
-    if trade_side == "SELL" and curr > 0:
-        return True
-    return False
+# ── TP / SL ────────────────────────────────────────────────────────── #
+
+def tp_sl(entry: float, side: str, candles_15m: list[dict] = None) -> tuple[float, float]:
+    """Retorna (take_profit, stop_loss) para el precio de entrada dado."""
+    if side == "LONG":
+        return entry * (1 + TP_PCT), entry * (1 - SL_PCT)
+    else:
+        return entry * (1 - TP_PCT), entry * (1 + SL_PCT)
