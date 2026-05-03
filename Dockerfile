@@ -5,8 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY src/ ./src/
+# FIX: archivos están en la raíz, no en src/
+COPY *.py .
 
 # -u → stdout sin buffer (logs visibles en Railway en tiempo real)
-# Sin EXPOSE → Railway lo trata como worker, sin healthcheck HTTP
-CMD ["python", "-u", "src/bot.py"]
+CMD ["python", "-u", "bot.py"]
