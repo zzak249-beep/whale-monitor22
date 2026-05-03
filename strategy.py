@@ -1,230 +1,144 @@
-# -*- coding: utf-8 -*-
-"""strategy.py -- Three Step Bot v5.
-
-FIXES vs v3/v4 (why no trades were opening):
-  1. score >= 2 was too strict → lowered to score >= 1 (score is BONUS, not gate)
-  2. d2_curr <= 0 strict → relaxed to d2_curr >= -small_tolerance
-  3. min_atr_pct=0.3% was killing DOGE/XRP/ADA → lowered to 0.05%
-  4. EMA50 trend filter optional and relaxed (allow ±0.3% tolerance)
-  5. Added REJECT REASON logging so you can see WHY each signal was skipped
-
-NEW FEATURES:
-  6. Trading session filter: only trade London+NY overlap (07:00-20:00 UTC)
-  7. Funding rate filter: skip LONG when funding > +0.05%, skip SHORT < -0.05%
-  8. Funding rate fetched from BingX API
 """
-from __future__ import annotations
+Estrategia Maki — ZigZag + SMA-20 (4H) + RSI-14 (15m)
 
-import numpy as np
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from loguru import logger
+BUGS CORREGIDOS vs versión anterior:
+  1. PIVOT_BARS era 5 → ahora 3: con 5 barras a cada lado casi nunca
+     se confirma un pivote en las últimas velas disponibles.
+  2. Solo pedíamos 60 velas 15m → ahora 100: más historia = más pivotes.
+  3. Condición de cruce era prev_c <= peak < last_c (ventana de 1 vela,
+     casi imposible). Ahora: prev_c < peak <= last_c, que captura el
+     momento exacto en que el cierre supera el nivel por primera vez.
+  4. RSI_OB=65 / RSI_OS=35 eran demasiado estrictos → ahora 70/30.
+"""
+import logging
+from typing import Optional
+
+logger = logging.getLogger("strategy")
+
+# ── parámetros ────────────────────────────────────────────────────── #
+TP_PCT     = 0.0045   # Take Profit +0.45%
+SL_PCT     = 0.0030   # Stop Loss   -0.30%
+PIVOT_BARS = 3        # FIX: era 5, demasiado restrictivo
+RSI_PERIOD = 14
+RSI_OB     = 70       # FIX: era 65, filtraba demasiado
+RSI_OS     = 30       # FIX: era 35, filtraba demasiado
+MIN_15M    = 100      # FIX: era 60, necesitamos más historia para pivotes
+MIN_4H     = 25
 
 
-@dataclass
-class Signal:
-    symbol:    str
-    side:      str
-    price:     float
-    sl:        float
-    tp:        float
-    atr:       float
-    delta1:    float
-    delta2:    float
-    delta3:    float
-    score:     int
-    vol_ratio: float
+# ── indicadores ───────────────────────────────────────────────────── #
 
-
-# ── Indicators ────────────────────────────────────────────────────────────────
-
-def _rolling_sum(arr: np.ndarray, n: int) -> np.ndarray:
-    cs  = np.cumsum(arr)
-    out = cs.copy()
-    out[n:] = cs[n:] - cs[:-n]
-    out[:n] = cs[:n]
+def _sma(values: list, period: int) -> list:
+    out = []
+    for i in range(len(values)):
+        if i < period - 1:
+            out.append(None)
+        else:
+            out.append(sum(values[i - period + 1: i + 1]) / period)
     return out
 
 
-def _ema(arr: np.ndarray, period: int) -> np.ndarray:
-    out = np.zeros_like(arr)
-    k   = 2.0 / (period + 1)
-    out[0] = arr[0]
-    for i in range(1, len(arr)):
-        out[i] = arr[i] * k + out[i - 1] * (1 - k)
-    return out
+def _rsi(closes: list, period: int = RSI_PERIOD) -> Optional[float]:
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        ag = (ag * (period - 1) + gains[i]) / period
+        al = (al * (period - 1) + losses[i]) / period
+    if al == 0:
+        return 100.0
+    return 100.0 - (100.0 / (1.0 + ag / al))
 
 
-def _atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int) -> np.ndarray:
-    prev = np.roll(closes, 1); prev[0] = closes[0]
-    tr   = np.maximum(highs - lows,
-           np.maximum(np.abs(highs - prev), np.abs(lows - prev)))
-    out  = np.zeros_like(tr)
-    out[period - 1] = tr[:period].mean()
-    for i in range(period, len(tr)):
-        out[i] = (out[i - 1] * (period - 1) + tr[i]) / period
-    return out
+# ── detección de pivotes ──────────────────────────────────────────── #
+
+def _pivot_high(highs: list) -> Optional[float]:
+    """Último máximo local confirmado por PIVOT_BARS velas a cada lado."""
+    n = len(highs)
+    for i in range(n - PIVOT_BARS - 1, PIVOT_BARS - 1, -1):
+        h = highs[i]
+        if (all(h > highs[i - j] for j in range(1, PIVOT_BARS + 1)) and
+                all(h > highs[i + j] for j in range(1, PIVOT_BARS + 1))):
+            return h
+    return None
 
 
-def compute_deltas(
-    opens: np.ndarray, closes: np.ndarray, volumes: np.ndarray, period: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    dv  = np.where(closes > opens, volumes, -volumes)
-    d1  = _rolling_sum(dv, period)
-    d2f = _rolling_sum(dv, period * 2)
-    d3f = _rolling_sum(dv, period * 3)
-    d2  = d2f - d1
-    d3  = d3f - d1 - d2
-    return d1, d2, d3
+def _pivot_low(lows: list) -> Optional[float]:
+    """Último mínimo local confirmado por PIVOT_BARS velas a cada lado."""
+    n = len(lows)
+    for i in range(n - PIVOT_BARS - 1, PIVOT_BARS - 1, -1):
+        lo = lows[i]
+        if (all(lo < lows[i - j] for j in range(1, PIVOT_BARS + 1)) and
+                all(lo < lows[i + j] for j in range(1, PIVOT_BARS + 1))):
+            return lo
+    return None
 
 
-# ── Session filter ─────────────────────────────────────────────────────────────
+# ── señal principal ───────────────────────────────────────────────── #
 
-def in_trading_session() -> bool:
-    """Only trade during London + NY sessions (07:00-20:00 UTC).
-    These sessions have the most volume and cleanest signals."""
-    hour = datetime.now(timezone.utc).hour
-    return 7 <= hour < 20
-
-
-# ── Main signal ───────────────────────────────────────────────────────────────
-
-def get_signal(
-    ohlcv:           dict,
-    symbol:          str,
-    period:          int   = 20,
-    atr_period:      int   = 14,
-    atr_mult:        float = 1.5,
-    rr:              float = 3.0,
-    min_volume_mult: float = 0.6,   # FIXED: was 0.8 — too strict
-    min_atr_pct:     float = 0.05,  # FIXED: was 0.3 — killed low-price coins
-    trend_filter:    bool  = True,
-    session_filter:  bool  = True,
-    funding_rate:    float = 0.0,   # passed from bot after API fetch
-) -> Signal | None:
-
-    opens   = ohlcv["open"]
-    highs   = ohlcv["high"]
-    lows    = ohlcv["low"]
-    closes  = ohlcv["close"]
-    volumes = ohlcv["volume"]
-
-    min_bars = period * 3 + atr_period + 55
-    if len(closes) < min_bars:
-        logger.debug(f"[{symbol}] SKIP: not enough bars ({len(closes)}<{min_bars})")
+def signal(candles_15m: list, candles_4h: list) -> Optional[str]:
+    """
+    Retorna 'LONG', 'SHORT' o None.
+    Velas en orden CRONOLÓGICO (más antigua → más reciente).
+    Cada vela: dict {o, h, l, c, v}.
+    """
+    if len(candles_15m) < MIN_15M or len(candles_4h) < MIN_4H:
         return None
 
-    # ── Session filter ────────────────────────────────────────────────────
-    if session_filter and not in_trading_session():
-        logger.debug(f"[{symbol}] SKIP: outside trading session")
+    # ── 1. Tendencia 4H: dirección de SMA-20 ──────────────────────── #
+    closes_4h = [c["c"] for c in candles_4h]
+    ma20      = [v for v in _sma(closes_4h, 20) if v is not None]
+    if len(ma20) < 2:
+        return None
+    ma_up   = ma20[-1] > ma20[-2]
+    ma_down = ma20[-1] < ma20[-2]
+    if not ma_up and not ma_down:
         return None
 
-    d1, d2, d3 = compute_deltas(opens, closes, volumes, period)
-    atr_arr     = _atr(highs, lows, closes, atr_period)
-    ema50       = _ema(closes, 50)
-
-    d1_prev = d1[-3]
-    d1_curr = d1[-2]
-    d2_curr = d2[-2]
-    d3_curr = d3[-2]
-    atr_val = atr_arr[-2]
-    price   = closes[-2]
-    ema_val = ema50[-2]
-
-    if atr_val <= 0 or price <= 0:
+    # ── 2. RSI 15m: filtro de sobreextensión ──────────────────────── #
+    closes_15m = [c["c"] for c in candles_15m]
+    rsi = _rsi(closes_15m)
+    if rsi is None:
         return None
 
-    # ── Filter 1: ATR minimum ─────────────────────────────────────────────
-    atr_pct = (atr_val / price) * 100
-    if atr_pct < min_atr_pct:
-        logger.debug(f"[{symbol}] SKIP: ATR too low ({atr_pct:.4f}% < {min_atr_pct}%)")
+    # ── 3. Pivotes 15m ────────────────────────────────────────────── #
+    highs  = [c["h"] for c in candles_15m]
+    lows   = [c["l"] for c in candles_15m]
+    peak   = _pivot_high(highs)
+    valley = _pivot_low(lows)
+    if peak is None or valley is None:
         return None
 
-    # ── Filter 2: Volume ─────────────────────────────────────────────────
-    avg_vol   = float(np.mean(volumes[-22:-2]))
-    bar_vol   = float(volumes[-2])
-    vol_ratio = (bar_vol / avg_vol) if avg_vol > 0 else 0
-    if vol_ratio < min_volume_mult:
-        logger.debug(f"[{symbol}] SKIP: vol {vol_ratio:.2f}x < {min_volume_mult}x")
-        return None
+    prev_c = candles_15m[-2]["c"]
+    last_c = candles_15m[-1]["c"]
 
-    # ── Filter 3: Delta1 crossover ────────────────────────────────────────
-    long_cross  = d1_prev <= 0 < d1_curr
-    short_cross = d1_prev >= 0 > d1_curr
+    # ── 4. Condición de entrada ────────────────────────────────────── #
+    # FIX: era prev_c <= peak < last_c (solo dispara 1 vela)
+    # AHORA: prev_c < peak <= last_c  (captura el cruce alcista)
+    long_cross  = prev_c < peak  <= last_c
+    short_cross = prev_c > valley >= last_c
 
-    if not long_cross and not short_cross:
-        logger.debug(f"[{symbol}] SKIP: no crossover d1_prev={d1_prev:.0f} d1_curr={d1_curr:.0f}")
-        return None
+    if long_cross and ma_up and rsi < RSI_OB:
+        logger.info(f"LONG  | peak={peak:.5f} | MA↑ | RSI={rsi:.1f}")
+        return "LONG"
 
-    # ── Filter 4: Delta2 — relaxed (just needs to not be strongly opposite) ──
-    # FIXED: was strict >0/<0, now allows small opposite readings
-    tolerance = abs(d1_curr) * 0.15  # 15% tolerance
-    if long_cross  and d2_curr < -tolerance:
-        logger.debug(f"[{symbol}] SKIP: d2 strongly negative for LONG ({d2_curr:.0f})")
-        return None
-    if short_cross and d2_curr >  tolerance:
-        logger.debug(f"[{symbol}] SKIP: d2 strongly positive for SHORT ({d2_curr:.0f})")
-        return None
+    if short_cross and ma_down and rsi > RSI_OS:
+        logger.info(f"SHORT | valley={valley:.5f} | MA↓ | RSI={rsi:.1f}")
+        return "SHORT"
 
-    # ── Filter 5: EMA50 trend — relaxed with 0.5% tolerance ─────────────
-    if trend_filter:
-        ema_tolerance = ema_val * 0.005  # 0.5% band around EMA
-        if long_cross  and price < ema_val - ema_tolerance:
-            logger.debug(f"[{symbol}] SKIP: LONG below EMA50 ({price:.6f} < {ema_val:.6f})")
-            return None
-        if short_cross and price > ema_val + ema_tolerance:
-            logger.debug(f"[{symbol}] SKIP: SHORT above EMA50 ({price:.6f} > {ema_val:.6f})")
-            return None
-
-    # ── Filter 6: Funding rate ────────────────────────────────────────────
-    if funding_rate != 0.0:
-        if long_cross  and funding_rate >  0.0005:  # >+0.05% = longs overloaded
-            logger.debug(f"[{symbol}] SKIP: funding too high for LONG ({funding_rate:.4%})")
-            return None
-        if short_cross and funding_rate < -0.0005:  # <-0.05% = shorts overloaded
-            logger.debug(f"[{symbol}] SKIP: funding too low for SHORT ({funding_rate:.4%})")
-            return None
-
-    # ── Confluence score (bonus, not gate) ───────────────────────────────
-    score = 1
-    if vol_ratio >= 1.5:                        score += 1
-    if d2_curr > 0 and long_cross:              score += 1
-    if d2_curr < 0 and short_cross:             score += 1
-    if abs(d3_curr) < abs(d2_curr):             score += 1
-    if atr_pct >= 0.5:                          score += 1
-    score = min(score, 5)
-
-    # Score >= 1 always passes — score is for PRIORITIZATION not filtering
-    sl_dist = atr_val * atr_mult
-    tp_dist = sl_dist * rr
-
-    logger.debug(
-        f"[{symbol}] ✅ SIGNAL {('BUY' if long_cross else 'SELL')} "
-        f"score={score} vol={vol_ratio:.1f}x atr={atr_pct:.3f}% "
-        f"d1={d1_curr:+.0f} d2={d2_curr:+.0f}"
-    )
-
-    if long_cross:
-        return Signal(
-            symbol=symbol, side="BUY", price=price,
-            sl=round(price - sl_dist, 8),
-            tp=round(price + tp_dist, 8),
-            atr=atr_val, delta1=d1_curr, delta2=d2_curr, delta3=d3_curr,
-            score=score, vol_ratio=round(vol_ratio, 2),
-        )
-    return Signal(
-        symbol=symbol, side="SELL", price=price,
-        sl=round(price + sl_dist, 8),
-        tp=round(price - tp_dist, 8),
-        atr=atr_val, delta1=d1_curr, delta2=d2_curr, delta3=d3_curr,
-        score=score, vol_ratio=round(vol_ratio, 2),
-    )
+    return None
 
 
-def delta1_flipped(ohlcv: dict, period: int, trade_side: str) -> bool:
-    opens = ohlcv["open"]; closes = ohlcv["close"]; volumes = ohlcv["volume"]
-    if len(closes) < period * 3 + 5:
-        return False
-    d1, _, _ = compute_deltas(opens, closes, volumes, period)
-    curr = d1[-2]
-    return (trade_side == "BUY" and curr < 0) or (trade_side == "SELL" and curr > 0)
+# ── TP / SL ───────────────────────────────────────────────────────── #
+
+def tp_sl(entry: float, side: str) -> tuple:
+    """Retorna (take_profit, stop_loss)."""
+    if side == "LONG":
+        return entry * (1 + TP_PCT), entry * (1 - SL_PCT)
+    return entry * (1 - TP_PCT), entry * (1 + SL_PCT)
