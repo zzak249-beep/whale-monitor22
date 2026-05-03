@@ -24,7 +24,7 @@ import signal as _signal
 from datetime import datetime, timezone
 
 from bingx    import BingXClient
-from strategy import signal as get_signal, tp_sl, score_symbol
+from strategy import signal, qty_by_risk, risk_reward
 from telegram import TelegramNotifier
 from risk     import RiskManager
 
