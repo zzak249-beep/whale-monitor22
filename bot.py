@@ -12,7 +12,10 @@ import signal as _signal
 from datetime import datetime, timezone
 
 from bingx    import BingXClient
-from strategy import signal as get_signal, qty_by_risk, risk_reward
+import strategy as _strategy
+get_signal   = _strategy.signal
+qty_by_risk  = _strategy.qty_by_risk
+risk_reward  = _strategy.risk_reward
 from telegram import TelegramNotifier
 from risk     import RiskManager
 
