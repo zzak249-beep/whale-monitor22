@@ -1,83 +1,83 @@
-"""
-Notificador Telegram con cola y reintentos.
-Solo usa stdlib + aiohttp.
-"""
+# -*- coding: utf-8 -*-
+"""telegram.py -- Maki Bot PRO — Notificador Telegram."""
+from __future__ import annotations
 import asyncio
-import logging
-import aiohttp
-
-logger     = logging.getLogger("telegram")
-MAX_LEN    = 4096
-MAX_RETRY  = 3
+import re
+from loguru import logger
 
 
-async def _send_once(token: str, chat_id: str, text: str) -> bool:
-    """Intenta enviar un mensaje. Retorna True si tuvo éxito."""
-    if len(text) > MAX_LEN:
-        text = text[:MAX_LEN - 3] + "..."
-    url     = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-
-    try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as sess:
-            async with sess.post(url, json=payload) as r:
-                if r.status == 200:
-                    return True
-                body = await r.text()
-                # Si falla por Markdown inválido → reintentar sin formato
-                if r.status == 400:
-                    payload.pop("parse_mode", None)
-                    async with sess.post(url, json=payload) as r2:
-                        return r2.status == 200
-                logger.error(f"Telegram {r.status}: {body[:200]}")
-    except Exception as e:
-        logger.error(f"Telegram send error: {e}")
-    return False
-
-
-async def send(token: str, chat_id: str, text: str):
-    """Envía un mensaje con reintentos."""
-    for attempt in range(MAX_RETRY):
-        ok = await _send_once(token, chat_id, text)
-        if ok:
-            return
-        if attempt < MAX_RETRY - 1:
-            await asyncio.sleep(2 ** attempt)
-    logger.error(f"Telegram: mensaje descartado tras {MAX_RETRY} intentos")
+def _esc(text: str) -> str:
+    """Escapa caracteres especiales para MarkdownV2."""
+    return re.sub(r'([_\*\[\]()~`>#+\-=|{}.!])', r'\\\1', str(text))
 
 
 class TelegramNotifier:
-    """
-    Cola FIFO asíncrona para enviar mensajes sin bloquear el loop del bot.
-    Respeta el límite de ~30 mensajes/segundo de Telegram.
-    """
-
     def __init__(self, token: str, chat_id: str):
-        self.token   = token
-        self.chat_id = chat_id
-        self._q: asyncio.Queue = asyncio.Queue()
-        self._task = None
+        self._token   = token
+        self._chat_id = chat_id
+        self._queue:  asyncio.Queue | None = None
+        self._task:   asyncio.Task  | None = None
 
     def start(self):
-        self._task = asyncio.create_task(self._worker())
+        """Arranca el worker de envío. Llamar dentro del event loop."""
+        self._queue = asyncio.Queue()
+        self._task  = asyncio.create_task(self._worker())
+
+    async def stop(self):
+        if self._queue:
+            await self._queue.join()
+        if self._task:
+            self._task.cancel()
+
+    async def notify(self, text: str):
+        """Encola un mensaje para enviar."""
+        if self._queue is None:
+            await self._send(text)
+        else:
+            await self._queue.put(text)
 
     async def _worker(self):
         while True:
-            text = await self._q.get()
-            await send(self.token, self.chat_id, text)
-            await asyncio.sleep(0.4)   # max ~2.5 msg/s, bien por debajo del límite
-            self._q.task_done()
-
-    async def notify(self, text: str):
-        """Encola un mensaje (no bloqueante)."""
-        await self._q.put(text)
-
-    async def stop(self):
-        if self._task:
-            self._task.cancel()
+            text = await self._queue.get()
             try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+                await self._send(text)
+            except Exception as e:
+                logger.warning(f"[TG worker] {e}")
+            finally:
+                self._queue.task_done()
+            await asyncio.sleep(0.5)   # rate-limit Telegram
+
+    async def _send(self, text: str, retries: int = 3) -> bool:
+        if not self._token or not self._chat_id:
+            logger.warning("[TG] Token o chat_id no configurados")
+            return False
+
+        import aiohttp
+        url     = f"https://api.telegram.org/bot{self._token}/sendMessage"
+        payload = {
+            "chat_id":    self._chat_id,
+            "text":       text,
+            "parse_mode": "Markdown",
+        }
+
+        for attempt in range(1, retries + 1):
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.post(url, json=payload,
+                                      timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        body = await r.text()
+                        if r.status == 200:
+                            return True
+                        logger.warning(f"[TG] HTTP {r.status} intento {attempt}: {body[:150]}")
+                        if r.status == 400:
+                            logger.error(f"[TG] Formato inválido: {text[:200]}")
+                            return False
+            except asyncio.TimeoutError:
+                logger.warning(f"[TG] Timeout intento {attempt}")
+            except Exception as e:
+                logger.warning(f"[TG] Error intento {attempt}: {e}")
+
+            if attempt < retries:
+                await asyncio.sleep(2 ** attempt)
+
+        return False

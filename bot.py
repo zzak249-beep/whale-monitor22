@@ -1,20 +1,8 @@
+# -*- coding: utf-8 -*-
 """
 Maki Bot PRO — Motor de ejecución
 ══════════════════════════════════
-
-Ventajas sobre bots competidores:
-  1. SCAN PARALELO: todos los pares simultáneamente con asyncio.gather
-     → detecta señales en ~0.5s vs ~8s de bots secuenciales
-  2. TRAILING STOP: mueve SL a break-even cuando el trade va al 50% del TP
-     → protege ganancias sin intervención manual
-  3. FILTRO HORARIO: evita los 3 primeros minutos de cada hora
-     → zona de máxima manipulación en crypto
-  4. ANTI-CORRELACIÓN: máximo 2 trades en la misma dirección
-     → diversifica el riesgo
-  5. DRAWDOWN DIARIO: pausa automática si pérdidas > límite configurado
-     → protección de capital absoluta
-  6. PRECIOS EN BATCH: un solo endpoint para precios de todos los pares
-     → 20× menos llamadas API en el monitor
+Estrategia: ZigZag++ 15m · HMA · Volume Delta · ATR dinámico
 """
 import asyncio
 import logging
@@ -24,7 +12,7 @@ import signal as _signal
 from datetime import datetime, timezone
 
 from bingx    import BingXClient
-from strategy import signal, qty_by_risk, risk_reward
+from strategy import signal as get_signal, qty_by_risk, risk_reward
 from telegram import TelegramNotifier
 from risk     import RiskManager
 
@@ -37,7 +25,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bot")
 
-# ── config ────────────────────────────────────────────────────────── #
+
+# ── config desde variables de entorno ─────────────────────────────── #
 def _env(key: str, default: str = None) -> str:
     v = os.environ.get(key, default)
     if v is None:
@@ -50,19 +39,20 @@ API_SECRET    = _env("BINGX_API_SECRET")
 TG_TOKEN      = _env("TELEGRAM_BOT_TOKEN")
 TG_CHAT       = _env("TELEGRAM_CHAT_ID")
 
-TRADE_USDT    = float(_env("TRADE_AMOUNT_USDT",      "10"))
-MAX_TRADES    = int(_env("MAX_OPEN_TRADES",            "3"))
-SCAN_SECS     = int(_env("SCAN_INTERVAL_SECONDS",     "60"))
-TOP_N         = int(_env("TOP_N_SYMBOLS",             "20"))
-LEVERAGE      = int(_env("LEVERAGE",                   "5"))
-MIN_BAL       = float(_env("MIN_BALANCE_USDT",        "20"))
-COOLDOWN_S    = int(_env("COOLDOWN_SECONDS",          "300"))
-HEARTBEAT_MIN = int(_env("HEARTBEAT_MINUTES",         "60"))
-MAX_DD_USDT   = float(_env("MAX_DAILY_LOSS_USDT",    "30"))   # pausa si pérd. diaria > esto
-MAX_SAME_DIR  = int(_env("MAX_SAME_DIRECTION",         "2"))   # máx trades en misma dirección
+TRADE_USDT    = float(_env("TRADE_AMOUNT_USDT",    "10"))
+MAX_TRADES    = int(_env("MAX_OPEN_TRADES",          "3"))
+SCAN_SECS     = int(_env("SCAN_INTERVAL_SECONDS",   "60"))
+TOP_N         = int(_env("TOP_N_SYMBOLS",           "20"))
+LEVERAGE      = int(_env("LEVERAGE",                 "5"))
+MIN_BAL       = float(_env("MIN_BALANCE_USDT",      "20"))
+COOLDOWN_S    = int(_env("COOLDOWN_SECONDS",        "300"))
+HEARTBEAT_MIN = int(_env("HEARTBEAT_MINUTES",       "60"))
+MAX_DD_USDT   = float(_env("MAX_DAILY_LOSS_USDT",  "30"))
+MAX_SAME_DIR  = int(_env("MAX_SAME_DIRECTION",       "2"))
 
-# ── estado ────────────────────────────────────────────────────────── #
-open_trades: dict = {}   # symbol → {side,entry,tp,sl,qty,order_id,be_activated}
+
+# ── estado global ─────────────────────────────────────────────────── #
+open_trades: dict = {}   # symbol → trade dict
 cooldowns:   dict = {}
 _shutdown         = False
 
@@ -76,23 +66,17 @@ def _in_cooldown(sym: str) -> bool:
     return (_now() - cooldowns.get(sym, 0)) < COOLDOWN_S
 
 def _pnl(trade: dict, exit_price: float) -> float:
-    if trade["side"] == "LONG":
+    if trade["side"] in ("BUY", "LONG"):
         return (exit_price - trade["entry"]) * trade["qty"]
     return (trade["entry"] - exit_price) * trade["qty"]
 
 
-# ── monitor paralelo ──────────────────────────────────────────────── #
+# ── monitor posiciones ────────────────────────────────────────────── #
 
 async def monitor(client: BingXClient, tg: TelegramNotifier, rm: RiskManager):
-    """
-    Monitoriza posiciones abiertas.
-    VENTAJA: obtiene todos los precios en UNA llamada (prices_multi)
-    en lugar de N llamadas individuales.
-    """
     if not open_trades:
         return
 
-    # Verificar qué posiciones siguen abiertas en BingX
     try:
         positions = await client.get_open_positions()
         open_syms = {p["symbol"] for p in positions}
@@ -100,7 +84,6 @@ async def monitor(client: BingXClient, tg: TelegramNotifier, rm: RiskManager):
         logger.warning(f"monitor positions: {e}")
         open_syms = set(open_trades.keys())
 
-    # Obtener todos los precios de una vez
     prices = await client.prices_multi(list(open_trades.keys()))
 
     for sym in list(open_trades.keys()):
@@ -108,12 +91,12 @@ async def monitor(client: BingXClient, tg: TelegramNotifier, rm: RiskManager):
         side  = trade["side"]
         price = prices.get(sym, 0)
 
-        # ── cerrada automáticamente por BingX ── #
+        # Cerrada por BingX (TP/SL automático)
         if sym not in open_syms:
             if price <= 0:
                 price = trade["entry"]
             pnl    = _pnl(trade, price)
-            hit_tp = (price >= trade["tp"]) if side == "LONG" else (price <= trade["tp"])
+            hit_tp = (price >= trade["tp"]) if side in ("BUY","LONG") else (price <= trade["tp"])
             reason = "TP ✅" if hit_tp else "SL ❌"
             icon   = "🟢" if hit_tp else "🔴"
             del open_trades[sym]
@@ -130,7 +113,7 @@ async def monitor(client: BingXClient, tg: TelegramNotifier, rm: RiskManager):
         if price <= 0:
             continue
 
-        # ── trailing stop: mover SL a break-even ── #
+        # Trailing stop → break-even
         new_sl = rm.check_trailing(trade, price)
         if new_sl is not None:
             ok = await client.update_sl(sym, side, trade["qty"], new_sl)
@@ -142,9 +125,9 @@ async def monitor(client: BingXClient, tg: TelegramNotifier, rm: RiskManager):
                     f"SL movido a `{new_sl:.5f}` (entrada protegida)"
                 )
 
-        # ── TP/SL manual como respaldo ── #
-        hit_tp = price >= trade["tp"] if side == "LONG" else price <= trade["tp"]
-        hit_sl = price <= trade["sl"] if side == "LONG" else price >= trade["sl"]
+        # TP/SL manual como respaldo
+        hit_tp = price >= trade["tp"] if side in ("BUY","LONG") else price <= trade["tp"]
+        hit_sl = price <= trade["sl"] if side in ("BUY","LONG") else price >= trade["sl"]
 
         if hit_tp or hit_sl:
             reason = "TP ✅" if hit_tp else "SL ❌"
@@ -168,25 +151,19 @@ async def monitor(client: BingXClient, tg: TelegramNotifier, rm: RiskManager):
 # ── scan paralelo ─────────────────────────────────────────────────── #
 
 async def _fetch_symbol(client: BingXClient, sym: str) -> tuple:
-    """Descarga datos de un símbolo. Usado en gather()."""
     try:
-        c15, c4h = await client.klines_multi(sym)
-        return sym, c15, c4h
+        c15, _ = await client.klines_multi(sym)
+        return sym, c15
     except Exception as e:
         logger.debug(f"fetch {sym}: {e}")
-        return sym, None, None
+        return sym, None
 
 
 async def scan(client: BingXClient, tg: TelegramNotifier, rm: RiskManager, symbols: list):
-    """
-    SCAN PARALELO: descarga datos de todos los pares simultáneamente.
-    Típicamente 15-20× más rápido que un scan secuencial.
-    """
     if len(open_trades) >= MAX_TRADES:
         return
 
-    # Filtros previos al scan
-    can, reason = rm.can_trade(0)
+    can, reason = rm.can_trade(len(open_trades))
     if not can:
         logger.info(f"Scan omitido: {reason}")
         return
@@ -203,41 +180,27 @@ async def scan(client: BingXClient, tg: TelegramNotifier, rm: RiskManager, symbo
         logger.warning(f"Balance {balance:.2f} < {MIN_BAL} — scan pausado")
         return
 
-    # Filtrar símbolos candidatos
-    candidates = [
-        s for s in symbols
-        if s not in open_trades and not _in_cooldown(s)
-    ]
+    candidates = [s for s in symbols if s not in open_trades and not _in_cooldown(s)]
     if not candidates:
         return
 
-    # ── DESCARGA PARALELA de todos los candidatos ── #
+    # Descarga paralela
     tasks   = [_fetch_symbol(client, sym) for sym in candidates]
     results = await asyncio.gather(*tasks, return_exceptions=False)
 
-    # Puntuar y ordenar por actividad (los más volátiles primero)
-    scored = []
-    for sym, c15, c4h in results:
-        if c15 is None or c4h is None:
-            continue
-        sc = score_symbol(c15)
-        scored.append((sc, sym, c15, c4h))
-    scored.sort(reverse=True)   # mayor score primero
-
-    # Evaluar señales
-    for _, sym, c15, c4h in scored:
+    for sym, c15 in results:
         if _shutdown or len(open_trades) >= MAX_TRADES:
             break
+        if not c15 or len(c15) < 120:
+            continue
 
-        sig = get_signal(c15, c4h)
+        sig = get_signal(c15)
         if sig is None:
             continue
 
-        # Anti-correlación
-        if not rm.direction_ok(open_trades, sig, MAX_SAME_DIR):
+        if not rm.direction_ok(open_trades, sig["side"], MAX_SAME_DIR):
             continue
 
-        # Precio real de mercado
         try:
             price = await client.last_price(sym)
         except Exception:
@@ -245,20 +208,17 @@ async def scan(client: BingXClient, tg: TelegramNotifier, rm: RiskManager, symbo
         if price <= 0:
             continue
 
-        tp, sl = tp_sl(price, sig, c15)
-        qty    = rm.calc_qty(price)
+        tp  = sig["tp"]
+        sl  = sig["sl"]
+        qty = rm.calc_qty(price)
         if qty <= 0:
             continue
 
-        # Validar ratio R:R mínimo (TP debe ser al menos 1× el SL)
-        tp_dist = abs(tp - price)
-        sl_dist = abs(sl - price)
-        if sl_dist > 0 and (tp_dist / sl_dist) < 1.0:
-            logger.debug(f"{sym}: ratio R:R insuficiente ({tp_dist/sl_dist:.2f})")
-            continue
+        rr = sig["rr"]
+        logger.info(f"SEÑAL: {sym} {sig['side']} @ {price:.5f} TP={tp:.5f} SL={sl:.5f} R:R={rr}")
 
         try:
-            order_id = await client.open_order(sym, sig, qty, tp, sl, LEVERAGE)
+            order_id = await client.open_order(sym, sig["side"], qty, tp, sl, LEVERAGE)
         except Exception as e:
             logger.error(f"open_order {sym}: {e}")
             await tg.notify(f"⚠️ Error abriendo `{sym}`:\n`{str(e)[:180]}`")
@@ -266,7 +226,7 @@ async def scan(client: BingXClient, tg: TelegramNotifier, rm: RiskManager, symbo
 
         open_trades[sym] = {
             "symbol":       sym,
-            "side":         sig,
+            "side":         sig["side"],
             "entry":        price,
             "tp":           tp,
             "sl":           sl,
@@ -276,14 +236,14 @@ async def scan(client: BingXClient, tg: TelegramNotifier, rm: RiskManager, symbo
             "ts":           _now(),
         }
 
-        rr = round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0
-        emoji = "📈" if sig == "LONG" else "📉"
-        logger.info(f"TRADE: {sym} {sig} @ {price:.5f} TP={tp:.5f} SL={sl:.5f} R:R={rr}")
+        emoji = "📈" if sig["side"] in ("BUY","LONG") else "📉"
+        reasons = " · ".join(sig.get("reasons", []))
         await tg.notify(
-            f"{emoji} *{sig} — {sym}*\n"
+            f"{emoji} *{sig['side']} — {sym}*\n"
             f"Entrada: `{price:.5f}`\n"
             f"TP: `{tp:.5f}` | SL: `{sl:.5f}`\n"
-            f"R:R `{rr}:1` | Qty: `{qty}` | `{LEVERAGE}x`"
+            f"R:R `{rr}:1` | Qty: `{qty}` | `{LEVERAGE}x`\n"
+            f"_{reasons}_"
         )
         await asyncio.sleep(0.3)
 
@@ -350,27 +310,32 @@ async def main():
     await tg.notify(
         f"🤖 *Maki Bot PRO iniciado*\n"
         f"Balance: `{balance:.2f} USDT`\n"
-        f"Trade: `{TRADE_USDT} USDT` × `{LEVERAGE}x` lev.\n"
+        f"Trade: `{TRADE_USDT} USDT` × `{LEVERAGE}x`\n"
         f"Pares: `{len(symbols)}` | Max: `{MAX_TRADES}` | Scan: `{SCAN_SECS}s`\n"
-        f"TP/SL dinámico por ATR | Trailing BE | Anti-DD\n"
+        f"ZigZag++ · HMA · Volume Delta · ATR dinámico\n"
         f"Max pérdida diaria: `{MAX_DD_USDT} USDT`"
     )
 
     last_heartbeat = _now()
     last_refresh   = _now()
+    cycle          = 0
 
     while not _shutdown:
+        cycle += 1
         try:
             await monitor(client, tg, rm)
             await scan(client, tg, rm, symbols)
 
-            # Refrescar ranking de pares cada hora
+            logger.info(
+                f"CICLO {cycle:04d} | {len(symbols)} pares | "
+                f"open={len(open_trades)}/{MAX_TRADES}"
+            )
+
             if (_now() - last_refresh) >= 3600:
                 symbols      = await client.top_symbols_by_volume(TOP_N)
                 last_refresh = _now()
                 logger.info(f"Pares actualizados: {len(symbols)}")
 
-            # Heartbeat
             if (_now() - last_heartbeat) >= HEARTBEAT_MIN * 60:
                 await heartbeat(client, tg, rm)
                 last_heartbeat = _now()

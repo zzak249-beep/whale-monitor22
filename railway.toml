@@ -1,5 +1,7 @@
-[phases.install]
-cmds = ["pip install -r requirements.txt"]
+[build]
+builder = "nixpacks"
 
-[start]
-cmd = "python bot.py"
+[deploy]
+startCommand = "python bot.py"
+restartPolicyType = "always"
+restartPolicyMaxRetries = 10

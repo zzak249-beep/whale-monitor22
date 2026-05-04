@@ -1,121 +1,110 @@
-"""Risk management system for position sizing and stop-loss/take-profit calculation."""
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import Tuple, Dict
-from loguru import logger
-
-from core.config import cfg
+# -*- coding: utf-8 -*-
+"""risk.py -- Maki Bot PRO — Gestión de riesgo."""
+from __future__ import annotations
+import math
+from datetime import datetime, timezone
 
 
-@dataclass
 class RiskManager:
-    """Manages position sizing, SL/TP, and trading permissions."""
-    
-    balance: float = 0.0
-    open_positions: int = 0
-    daily_pnl: float = 0.0
-    last_daily_reset: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    is_halted: bool = False
-    halt_reason: str = ""
-    correlation_symbols: Dict[str, float] = field(default_factory=dict)
-    
-    def set_balance(self, balance: float) -> None:
-        """Update current balance."""
-        self.balance = balance
-        
-        # Check daily loss limit
-        if self.daily_pnl < -cfg.max_daily_loss:
-            self.is_halted = True
-            self.halt_reason = f"Daily loss limit hit: ${self.daily_pnl:.2f} USDT"
-            logger.warning(self.halt_reason)
-    
-    def record_open(self, symbol: str) -> None:
-        """Record opening of a position."""
-        self.open_positions += 1
-    
-    def record_close(self, symbol: str, pnl: float, balance: float) -> None:
-        """Record closing of a position."""
-        self.open_positions = max(0, self.open_positions - 1)
-        self.daily_pnl += pnl
-        self.balance = balance
-        
-        # Check daily loss limit
-        if self.daily_pnl < -cfg.max_daily_loss:
-            self.is_halted = True
-            self.halt_reason = f"Daily loss limit hit: ${self.daily_pnl:.2f} USDT"
-    
-    def can_trade(self, balance: float) -> Tuple[bool, str]:
-        """Check if trading is allowed."""
-        # Check halt status
-        if self.is_halted:
-            return False, "Bot halted due to daily loss limit"
-        
-        # Check balance
-        if balance <= 0:
-            return False, "Insufficient balance"
-        
-        # Check max open positions
-        if self.open_positions >= cfg.max_open_trades:
-            return False, f"Max open positions reached ({self.open_positions})"
-        
-        return True, "OK"
-    
-    def correlation_ok(self, symbol: str) -> bool:
-        """Check if symbol is not too correlated with open positions."""
-        # Simple correlation check - can be enhanced
-        # For now, accept all
-        return True
-    
-    def position_size(
-        self, balance: float, n_open: int, confidence: float = 50, atr_pct: float = 1.0
-    ) -> float:
-        """Calculate position size based on risk management rules."""
-        
-        # Base size: equal weight per max open trades
-        base_size = (balance * cfg.max_risk_per_trade / 100) / cfg.max_open_trades
-        
-        # Adjust by confidence (higher confidence = larger position)
-        confidence_multiplier = (confidence - 40) / 30  # Map 40-70% to 0-1
-        confidence_multiplier = max(0.5, min(1.5, confidence_multiplier))  # Clamp 0.5-1.5
-        
-        # Adjust by ATR volatility (higher volatility = smaller position)
-        atr_multiplier = 1.0 / (1 + atr_pct / 100)
-        
-        size = base_size * confidence_multiplier * atr_multiplier
-        
-        # Minimum viable position
-        min_size = 10  # $10 minimum
-        return max(min_size, size)
-    
-    def dynamic_sl_tp(
-        self, entry_price: float, side: str, atr: float = 0.0
-    ) -> Tuple[float, float, float, float]:
-        """Calculate dynamic stop-loss and take-profit levels based on ATR."""
-        
-        # SL: 2x ATR or 2% - whichever is larger
-        sl_distance = max(atr, entry_price * 0.02)
-        sl_pct = (sl_distance / entry_price) * 100
-        
-        # TP: 3x SL distance (risk/reward 1:3)
-        tp_distance = sl_distance * 3
-        tp_pct = (tp_distance / entry_price) * 100
-        
-        if side == "BUY":
-            sl = entry_price - sl_distance
-            tp = entry_price + tp_distance
-        else:  # SELL
-            sl = entry_price + sl_distance
-            tp = entry_price - tp_distance
-        
-        return sl, tp, sl_pct, tp_pct
-    
-    def summary(self) -> Dict:
-        """Get current risk status summary."""
+    def __init__(self, trade_usdt: float, max_trades: int, max_dd_pct: float):
+        self._trade_usdt  = trade_usdt
+        self._max_trades  = max_trades
+        self._max_dd_usdt = max_dd_pct   # recibe como USDT absoluto
+
+        self._daily_pnl:    float = 0.0
+        self._trades_today: int   = 0
+        self._paused:       bool  = False
+        self._day:          int   = datetime.now(timezone.utc).day
+
+    # ── Reset diario ─────────────────────────────────────────────────────────
+
+    def _check_day(self):
+        today = datetime.now(timezone.utc).day
+        if today != self._day:
+            self._daily_pnl    = 0.0
+            self._trades_today = 0
+            self._paused       = False
+            self._day          = today
+
+    # ── Registro de cierres ──────────────────────────────────────────────────
+
+    def register_close(self, pnl: float):
+        self._check_day()
+        self._daily_pnl    += pnl
+        self._trades_today += 1
+        if self._daily_pnl <= -abs(self._max_dd_usdt):
+            self._paused = True
+
+    # ── Validaciones ─────────────────────────────────────────────────────────
+
+    def can_trade(self, open_count: int) -> tuple[bool, str]:
+        self._check_day()
+        if self._paused:
+            return False, f"drawdown diario alcanzado ({self._daily_pnl:.2f} USDT)"
+        if open_count >= self._max_trades:
+            return False, f"máximo trades abiertos ({self._max_trades})"
+        return True, "ok"
+
+    def direction_ok(self, open_trades: dict, side: str, max_same: int) -> bool:
+        """Máximo N trades en la misma dirección (anti-correlación)."""
+        count = sum(1 for t in open_trades.values() if t["side"] == side)
+        return count < max_same
+
+    def calc_qty(self, price: float) -> float:
+        """Cantidad en contratos para operar trade_usdt a precio dado."""
+        if price <= 0:
+            return 0.0
+        qty = self._trade_usdt / price
+        # Redondear a 3 decimales (mínimo BingX)
+        qty = math.floor(qty * 1000) / 1000
+        return qty if qty > 0 else 0.0
+
+    # ── Trailing stop (break-even) ───────────────────────────────────────────
+
+    def check_trailing(self, trade: dict, current_price: float) -> float | None:
+        """
+        Si el precio ha avanzado ≥50% hacia el TP, mueve el SL al entry.
+        Retorna el nuevo SL si debe moverse, None si no.
+        """
+        if trade.get("be_activated"):
+            return None
+
+        entry = trade["entry"]
+        tp    = trade["tp"]
+        sl    = trade["sl"]
+        side  = trade["side"]
+
+        tp_dist = abs(tp - entry)
+        if tp_dist <= 0:
+            return None
+
+        if side in ("BUY", "LONG"):
+            progress = (current_price - entry) / tp_dist
+            if progress >= 0.5 and current_price > entry:
+                return entry + (tp_dist * 0.02)  # SL ligeramente sobre entry
+        else:
+            progress = (entry - current_price) / tp_dist
+            if progress >= 0.5 and current_price < entry:
+                return entry - (tp_dist * 0.02)
+
+        return None
+
+    # ── Filtro horario ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def is_safe_time() -> bool:
+        """
+        Evita los 3 primeros minutos de cada hora (zona de manipulación).
+        """
+        m = datetime.now(timezone.utc).minute
+        return m >= 3
+
+    # ── Estado ───────────────────────────────────────────────────────────────
+
+    def status(self) -> dict:
+        self._check_day()
         return {
-            "balance": self.balance,
-            "open_positions": self.open_positions,
-            "daily_pnl": self.daily_pnl,
-            "is_halted": self.is_halted,
-            "halt_reason": self.halt_reason,
-            "max_daily_loss": cfg.max_daily_loss,
+            "daily_pnl":    round(self._daily_pnl, 4),
+            "trades_today": self._trades_today,
+            "paused":       self._paused,
         }
