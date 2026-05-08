@@ -109,8 +109,9 @@ SESSION_FILTER  = os.environ.get("SESSION_FILTER", "false").lower() == "true"
 SESSION_START   = int(os.environ.get("SESSION_START", "6"))
 SESSION_END     = int(os.environ.get("SESSION_END",  "22"))
 
-_raw = os.environ.get("CUSTOM_SYMBOLS", "")
-CUSTOM_SYMBOLS = [s.strip() for s in _raw.split(",") if s.strip()] if _raw else []
+# FIX: filtra cualquier valor vacío o basura — Railway puede pasar " " o ""
+_raw = os.environ.get("CUSTOM_SYMBOLS", "").strip()
+CUSTOM_SYMBOLS = [s.strip() for s in _raw.split(",") if s.strip() and len(s.strip()) > 3] if _raw else []
 
 BINGX_BASE   = "https://open-api.bingx.com"
 INTERVAL_MAP = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m","1h":"1H","4h":"4H"}
@@ -875,8 +876,17 @@ def main():
     log.info(f"  Slope≥{SLOPE_LIMIT}° OBLIGATORIO | ADX≥{ADX_MIN} | "
              f"EMA{EMA_TREND} | Anti-chop | Score≥{MIN_SCORE}")
 
-    symbols = CUSTOM_SYMBOLS if CUSTOM_SYMBOLS else get_all_symbols(MAX_SYMBOLS)
-    if not symbols: symbols = FALLBACK_SYMBOLS
+    # FIX: CUSTOM_SYMBOLS solo si tiene símbolos reales (evita lista con string vacío)
+    _use_custom = [s for s in CUSTOM_SYMBOLS if len(s) > 3]
+    if _use_custom:
+        symbols = _use_custom
+        log.info(f"Usando CUSTOM_SYMBOLS: {symbols}")
+    else:
+        # MAX_SYMBOLS=0 significa SIN límite — cargar todos
+        _limit = MAX_SYMBOLS if MAX_SYMBOLS and MAX_SYMBOLS > 0 else 0
+        symbols = get_all_symbols(_limit)
+    if not symbols:
+        symbols = FALLBACK_SYMBOLS
 
     balance   = get_balance()
     positions = get_all_positions()
