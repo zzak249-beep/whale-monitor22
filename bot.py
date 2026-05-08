@@ -204,22 +204,62 @@ def _is_valid(sym):
     return True
 
 def get_all_symbols(limit=0):
+    syms = []
+
+    # Fuente 1: contracts
     try:
         data = bx_get("/openApi/swap/v2/quote/contracts", {})
         contracts = data.get("data", [])
+        log.info(f"Contracts raw: {len(contracts)}")
         usdt = [c for c in contracts
                 if isinstance(c, dict) and c.get("asset","") == "USDT" and c.get("status") == 1]
         if not usdt:
             usdt = [c for c in contracts
                     if isinstance(c, dict) and c.get("asset","") == "USDT"]
+        if not usdt:
+            usdt = [c for c in contracts
+                    if isinstance(c, dict) and str(c.get("symbol","")).endswith("-USDT")]
         usdt.sort(key=lambda x: float(x.get("tradeAmount", 0) or 0), reverse=True)
-        syms   = [c["symbol"] for c in usdt if _is_valid(c.get("symbol",""))]
-        result = syms if limit == 0 else syms[:limit]
-        log.info(f"✅ {len(result)} símbolos cargados")
-        return result or FALLBACK_SYMBOLS
+        syms = [c["symbol"] for c in usdt if _is_valid(c.get("symbol",""))]
+        log.info(f"Contracts → {len(syms)} syms")
     except Exception as e:
-        log.warning(f"get_all_symbols: {e}")
+        log.warning(f"contracts fail: {e}")
+
+    # Fuente 2: ticker (si contracts falló o dio pocos resultados)
+    if len(syms) < 50:
+        try:
+            data2 = bx_get("/openApi/swap/v2/quote/ticker", {})
+            tickers = data2.get("data", [])
+            log.info(f"Ticker raw: {len(tickers)}")
+            t_syms = [t["symbol"] for t in tickers
+                      if isinstance(t, dict) and _is_valid(t.get("symbol",""))]
+            if len(t_syms) > len(syms):
+                syms = t_syms
+            log.info(f"Ticker → {len(syms)} syms")
+        except Exception as e:
+            log.warning(f"ticker fail: {e}")
+
+    # Fuente 3: premiumIndex
+    if len(syms) < 50:
+        try:
+            data3 = bx_get("/openApi/swap/v2/quote/premiumIndex", {})
+            items = data3.get("data", [])
+            log.info(f"PremiumIndex raw: {len(items)}")
+            p_syms = [it["symbol"] for it in items
+                      if isinstance(it, dict) and _is_valid(it.get("symbol",""))]
+            if len(p_syms) > len(syms):
+                syms = p_syms
+            log.info(f"PremiumIndex → {len(syms)} syms")
+        except Exception as e:
+            log.warning(f"premiumIndex fail: {e}")
+
+    if not syms:
+        log.warning(f"Todas las fuentes fallaron → fallback {len(FALLBACK_SYMBOLS)} sym")
         return FALLBACK_SYMBOLS
+
+    result = syms if limit == 0 else syms[:limit]
+    log.info(f"✅ {len(result)} símbolos listos")
+    return result
 
 def set_lev(symbol):
     for side in ("LONG","SHORT"):
